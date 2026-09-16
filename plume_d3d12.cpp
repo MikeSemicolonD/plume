@@ -8,6 +8,12 @@
 #include "plume_d3d12.h"
 
 #include <unordered_set>
+#include <thread>
+#include <chrono>
+#include <string>
+#include <vector>
+#include <atomic>
+#include <cwchar>
 
 #include <dxgi1_5.h>
 
@@ -21,9 +27,21 @@
 #pragma clang diagnostic pop
 #endif
 
+// RogueSquadron64Recomp: route D3D12 debug-layer messages to stderr so a bad barrier /
+// resource-state (which stalls the driver submit on the hangar frame) is visible without a
+// debugger attached. Registered via ID3D12InfoQueue1 below.
+static void CALLBACK rs64_d3d12_debug_msg(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity,
+        D3D12_MESSAGE_ID id, LPCSTR desc, void *) {
+    const char *s = (severity == D3D12_MESSAGE_SEVERITY_CORRUPTION) ? "CORRUPTION"
+                  : (severity == D3D12_MESSAGE_SEVERITY_ERROR) ? "ERROR"
+                  : (severity == D3D12_MESSAGE_SEVERITY_WARNING) ? "WARNING" : "INFO";
+    std::fprintf(stderr, "[d3d12-debug %s id=%d] %s\n", s, (int)id, desc ? desc : "");
+    std::fflush(stderr);
+}
+
 #ifndef NDEBUG
 #   define D3D12_DEBUG_LAYER_ENABLED
-#   define D3D12_DEBUG_LAYER_BREAK_ON_ERROR true
+#   define D3D12_DEBUG_LAYER_BREAK_ON_ERROR false
 #   define D3D12_DEBUG_LAYER_BREAK_ON_WARNING false
 #   define D3D12_DEBUG_LAYER_SUPRESS_SAMPLE_POSITIONS_ERROR // Supress error message that's been fixed in newer Agility SDK versions.
 //#   define D3D12_DEBUG_LAYER_GPU_BASED_VALIDATION_ENABLED
@@ -44,7 +62,14 @@ extern "C" {
 #endif
 
 namespace plume {
-    static const uint32_t ShaderDescriptorHeapSize = 65536;
+    // RS64: bumped 65536 -> 262144. The intro cinematic's broken F5 rendering floods the
+    // CBV_SRV_UAV view heap with thousands of tiny per-frame reinterpret/decode descriptor
+    // sets (liveSets seen climbing past 6000), fragmenting the 64K heap until a set allocation
+    // can't find contiguous space -> getCPUHandleAt/allocate assert (the cinematic crash that
+    // blocked reaching the menu). 256K gives headroom to survive the flood until the cinematic
+    // tears down (the menu itself needs few descriptors). This MITIGATES the symptom; the root
+    // is the per-frame reinterpret flood from the F5 cinematic render. D3D12 allows up to 1M.
+    static const uint32_t ShaderDescriptorHeapSize = 262144;
     static const uint32_t SamplerDescriptorHeapSize = 1024;
     static const uint32_t TargetDescriptorHeapSize = 16384;
 
@@ -937,11 +962,26 @@ namespace plume {
         if (viewDescriptorCount > 0) {
             viewAllocation.offset = device->viewHeapAllocator->allocate(viewDescriptorCount);
             if (viewAllocation.offset == D3D12DescriptorHeapAllocator::INVALID_OFFSET) {
-                fprintf(stderr, "Allocator was unable to find free space for the set.");
+                fprintf(stderr, "Allocator was unable to find free space for the set. (req=%u)\n", viewDescriptorCount);
                 return;
             }
 
             viewAllocation.count = viewDescriptorCount;
+            // Diagnostic (ROGUESQ_DESC_DIAG): track live view-descriptor-set count + total
+            // view descriptors held, to find which set leaks the CBV_SRV_UAV heap.
+            static int s_dd = -1;
+            if (s_dd < 0) { const char *e = std::getenv("ROGUESQ_DESC_DIAG"); s_dd = (e && e[0] && e[0] != '0') ? 1 : 0; }
+            if (s_dd) {
+                extern std::atomic<int64_t> g_plumeLiveSets;
+                extern std::atomic<int64_t> g_plumeLiveViewDesc;
+                int64_t ls = ++g_plumeLiveSets;
+                int64_t lv = (g_plumeLiveViewDesc += viewDescriptorCount);
+                static std::atomic<uint64_t> ctorN{0};
+                uint64_t n = ++ctorN;
+                if ((n & 511) == 0 || lv > 50000)
+                    fprintf(stderr, "[desc-live] ctor#%llu liveSets=%lld liveViewDesc=%lld thisReq=%u\n",
+                            (unsigned long long)n, (long long)ls, (long long)lv, viewDescriptorCount);
+            }
         }
 
         if (samplerDescriptorCount > 0) {
@@ -955,8 +995,13 @@ namespace plume {
         }
     }
 
+    std::atomic<int64_t> g_plumeLiveSets{0};
+    std::atomic<int64_t> g_plumeLiveViewDesc{0};
+
     D3D12DescriptorSet::~D3D12DescriptorSet() {
         if (viewAllocation.count > 0) {
+            --g_plumeLiveSets;
+            g_plumeLiveViewDesc -= viewAllocation.count;
             device->viewHeapAllocator->free(viewAllocation.offset, viewAllocation.count);
         }
 
@@ -1932,11 +1977,14 @@ namespace plume {
 
         D3D12_RESOURCE_BARRIER resourceBarrier;
         const RenderBufferFlags bufferUAVMask = RenderBufferFlag::UNORDERED_ACCESS | RenderBufferFlag::ACCELERATION_STRUCTURE;
+        static const bool s_lbb = [](){ const char* e = std::getenv("ROGUESQ_LOG_BARRIER"); return e && *e && *e != '0'; }();
         for (uint32_t i = 0; i < bufferBarriersCount; i++) {
             const RenderBufferBarrier &bufferBarrier = bufferBarriers[i];
             D3D12Buffer *interfaceBuffer = static_cast<D3D12Buffer *>(bufferBarrier.buffer);
             D3D12_RESOURCE_STATES stateBefore = interfaceBuffer->resourceStates;
             D3D12_RESOURCE_STATES stateAfter = toBufferState(stages, bufferBarrier.accessBits, interfaceBuffer->desc.flags);
+            if (s_lbb) { std::fprintf(stderr, "[barrier] tid=%lu cl=%p buf=%p qtype=%d flags=0x%X before=0x%X after=0x%X\n",
+                (unsigned long)GetCurrentThreadId(), (void*)this, (void*)interfaceBuffer->d3d, (int)queue->type, (unsigned)interfaceBuffer->desc.flags, (unsigned)stateBefore, (unsigned)stateAfter); std::fflush(stderr); }
             if (makeBarrier(interfaceBuffer->d3d, stateBefore, stateAfter, interfaceBuffer->desc.flags & bufferUAVMask, resourceBarrier)) {
                 barrierVector.emplace_back(resourceBarrier);
             }
@@ -1944,12 +1992,15 @@ namespace plume {
             interfaceBuffer->resourceStates = stateAfter;
         }
         
+        static const bool s_lb = [](){ const char* e = std::getenv("ROGUESQ_LOG_BARRIER"); return e && *e && *e != '0'; }();
         bool resetSamplePositionsRequired = false;
         for (uint32_t i = 0; i < textureBarriersCount; i++) {
             const RenderTextureBarrier &textureBarrier = textureBarriers[i];
             D3D12Texture *interfaceTexture = static_cast<D3D12Texture *>(textureBarrier.texture);
             D3D12_RESOURCE_STATES stateBefore = interfaceTexture->resourceStates;
             D3D12_RESOURCE_STATES stateAfter = toTextureState(stages, textureBarrier.layout, interfaceTexture->desc.flags);
+            if (s_lb) { std::fprintf(stderr, "[barrier] tex=%p qtype=%d flags=0x%X before=0x%X after=0x%X layout=%d\n",
+                (void*)interfaceTexture->d3d, (int)queue->type, (unsigned)interfaceTexture->desc.flags, (unsigned)stateBefore, (unsigned)stateAfter, (int)textureBarrier.layout); std::fflush(stderr); }
             bool madeBarrier = makeBarrier(interfaceTexture->d3d, stateBefore, stateAfter, interfaceTexture->desc.flags & RenderTextureFlag::UNORDERED_ACCESS, resourceBarrier);
             interfaceTexture->resourceStates = stateAfter;
             interfaceTexture->layout = textureBarrier.layout;
@@ -2764,6 +2815,11 @@ namespace plume {
             fprintf(stderr, "CreateResource failed with error code 0x%lX.\n", res);
             return;
         }
+        // ROGUESQ: name buffers so a GPU-validation StateBefore-invalid error identifies which buffer.
+        { static std::atomic<unsigned> s_id{0}; wchar_t nm[128];
+          _snwprintf_s(nm, _countof(nm), _TRUNCATE, L"rs64buf#%u sz%llu flags0x%X",
+              s_id.fetch_add(1), (unsigned long long)desc.size, (unsigned)desc.flags);
+          d3d->SetName(nm); }
     }
 
     D3D12Buffer::~D3D12Buffer() {
@@ -2880,6 +2936,13 @@ namespace plume {
             fprintf(stderr, "CreateResource failed with error code 0x%lX.\n", res);
             return;
         }
+        // ROGUESQ: name textures so a GPU-validation StateBefore-invalid error identifies the exact
+        // mis-tracked resource (render target / depth target / plain texture) and its dimensions.
+        { static std::atomic<unsigned> s_id{0}; wchar_t nm[128];
+          _snwprintf_s(nm, _countof(nm), _TRUNCATE, L"rs64tex#%u %s %ux%u fmt%d flags0x%X",
+              s_id.fetch_add(1), depthTarget ? L"DEPTH" : renderTarget ? L"RTV" : L"tex",
+              (unsigned)desc.width, (unsigned)desc.height, (int)desc.format, (unsigned)desc.flags);
+          d3d->SetName(nm); }
     }
 
     D3D12Texture::~D3D12Texture() {
@@ -3847,9 +3910,35 @@ namespace plume {
             newFilter.DenyList.pIDList = denyIds;
             infoQueue->PushStorageFilter(&newFilter);
 
-            infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, true);
+            infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, false);
             infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, D3D12_DEBUG_LAYER_BREAK_ON_ERROR);
             infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, D3D12_DEBUG_LAYER_BREAK_ON_WARNING);
+
+            // Route messages to stderr. ID3D12InfoQueue1's callback is unavailable on this runtime
+            // (E_NOINTERFACE), so drain the older ID3D12InfoQueue from a polling thread instead -
+            // this still captures the message even while the gfx thread is wedged in the driver.
+            infoQueue->AddRef();
+            std::thread([infoQueue]() {
+                std::string last;
+                for (;;) {
+                    const UINT64 n = infoQueue->GetNumStoredMessages();
+                    for (UINT64 i = 0; i < n; ++i) {
+                        SIZE_T len = 0;
+                        if (FAILED(infoQueue->GetMessage(i, nullptr, &len)) || len == 0) continue;
+                        std::vector<uint8_t> buf(len);
+                        D3D12_MESSAGE *m = reinterpret_cast<D3D12_MESSAGE *>(buf.data());
+                        if (FAILED(infoQueue->GetMessage(i, m, &len))) continue;
+                        const char *sev = (m->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION) ? "CORRUPTION"
+                                        : (m->Severity == D3D12_MESSAGE_SEVERITY_ERROR) ? "ERROR"
+                                        : (m->Severity == D3D12_MESSAGE_SEVERITY_WARNING) ? "WARNING" : "INFO";
+                        std::string cur = std::string(sev) + "|" + (m->pDescription ? m->pDescription : "");
+                        if (cur != last) { std::fprintf(stderr, "[d3d12-debug %s id=%d] %s\n", sev, (int)m->ID, m->pDescription ? m->pDescription : ""); std::fflush(stderr); last = cur; }
+                    }
+                    infoQueue->ClearStoredMessages();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                }
+            }).detach();
+            std::fprintf(stderr, "[d3d12-debug] info-queue drain thread started\n"); std::fflush(stderr);
         }
 #   endif
         
@@ -4180,12 +4269,15 @@ namespace plume {
         UINT dxgiFactoryFlags = 0;
 
 #   ifdef D3D12_DEBUG_LAYER_ENABLED
+        // ROGUESQ: the D3D12 debug layer adds heavy CPU validation to ExecuteCommandLists; it is
+        // now OFF unless ROGUESQ_D3D12_DEBUG (or _GPUVAL) is set, so Debug builds submit at
+        // production speed. (Was unconditionally on via #ifndef NDEBUG.)
         ID3D12Debug1 *debugController;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
+        if ((std::getenv("ROGUESQ_D3D12_DEBUG") || std::getenv("ROGUESQ_D3D12_GPUVAL")) &&
+            SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
             debugController->EnableDebugLayer();
-#       ifdef D3D12_DEBUG_LAYER_GPU_BASED_VALIDATION_ENABLED
-            debugController->SetEnableGPUBasedValidation(TRUE);
-#       endif
+            std::fprintf(stderr, "[d3d12-debug] debug layer ENABLED%s\n", std::getenv("ROGUESQ_D3D12_GPUVAL") ? " + GPU-based validation" : ""); std::fflush(stderr);
+            if (std::getenv("ROGUESQ_D3D12_GPUVAL")) debugController->SetEnableGPUBasedValidation(TRUE);
 
             // Enable additional debug layers.
             dxgiFactoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
