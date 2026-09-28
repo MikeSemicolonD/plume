@@ -1977,30 +1977,24 @@ namespace plume {
 
         D3D12_RESOURCE_BARRIER resourceBarrier;
         const RenderBufferFlags bufferUAVMask = RenderBufferFlag::UNORDERED_ACCESS | RenderBufferFlag::ACCELERATION_STRUCTURE;
-        static const bool s_lbb = [](){ const char* e = std::getenv("ROGUESQ_LOG_BARRIER"); return e && *e && *e != '0'; }();
         for (uint32_t i = 0; i < bufferBarriersCount; i++) {
             const RenderBufferBarrier &bufferBarrier = bufferBarriers[i];
             D3D12Buffer *interfaceBuffer = static_cast<D3D12Buffer *>(bufferBarrier.buffer);
             D3D12_RESOURCE_STATES stateBefore = interfaceBuffer->resourceStates;
             D3D12_RESOURCE_STATES stateAfter = toBufferState(stages, bufferBarrier.accessBits, interfaceBuffer->desc.flags);
-            if (s_lbb) { std::fprintf(stderr, "[barrier] tid=%lu cl=%p buf=%p qtype=%d flags=0x%X before=0x%X after=0x%X\n",
-                (unsigned long)GetCurrentThreadId(), (void*)this, (void*)interfaceBuffer->d3d, (int)queue->type, (unsigned)interfaceBuffer->desc.flags, (unsigned)stateBefore, (unsigned)stateAfter); std::fflush(stderr); }
             if (makeBarrier(interfaceBuffer->d3d, stateBefore, stateAfter, interfaceBuffer->desc.flags & bufferUAVMask, resourceBarrier)) {
                 barrierVector.emplace_back(resourceBarrier);
             }
 
             interfaceBuffer->resourceStates = stateAfter;
         }
-        
-        static const bool s_lb = [](){ const char* e = std::getenv("ROGUESQ_LOG_BARRIER"); return e && *e && *e != '0'; }();
+
         bool resetSamplePositionsRequired = false;
         for (uint32_t i = 0; i < textureBarriersCount; i++) {
             const RenderTextureBarrier &textureBarrier = textureBarriers[i];
             D3D12Texture *interfaceTexture = static_cast<D3D12Texture *>(textureBarrier.texture);
             D3D12_RESOURCE_STATES stateBefore = interfaceTexture->resourceStates;
             D3D12_RESOURCE_STATES stateAfter = toTextureState(stages, textureBarrier.layout, interfaceTexture->desc.flags);
-            if (s_lb) { std::fprintf(stderr, "[barrier] tex=%p qtype=%d flags=0x%X before=0x%X after=0x%X layout=%d\n",
-                (void*)interfaceTexture->d3d, (int)queue->type, (unsigned)interfaceTexture->desc.flags, (unsigned)stateBefore, (unsigned)stateAfter, (int)textureBarrier.layout); std::fflush(stderr); }
             bool madeBarrier = makeBarrier(interfaceTexture->d3d, stateBefore, stateAfter, interfaceTexture->desc.flags & RenderTextureFlag::UNORDERED_ACCESS, resourceBarrier);
             interfaceTexture->resourceStates = stateAfter;
             interfaceTexture->layout = textureBarrier.layout;

@@ -258,6 +258,7 @@ namespace plume {
         RenderWindow getWindow() const override;
         bool isEmpty() const override;
         uint32_t getRefreshRate() const override;
+        bool setWindow(RenderWindow renderWindow) override;
         void getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const;
         void releaseSwapChain();
         void releaseImageViews();

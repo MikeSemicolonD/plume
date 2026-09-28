@@ -2441,6 +2441,9 @@ namespace plume {
     }
 
     uint32_t VulkanSwapChain::getRefreshRate() const {
+        if (vk == VK_NULL_HANDLE) {
+            return 0;
+        }
         VkRefreshCycleDurationGOOGLE refreshCycle = {};
         VkResult res = vkGetRefreshCycleDurationGOOGLE(commandQueue->device->vk, vk, &refreshCycle);
         if (res != VK_SUCCESS) {
@@ -2451,7 +2454,46 @@ namespace plume {
         return std::lround(1000000000.0 / refreshCycle.refreshDuration);
     }
 
+    bool VulkanSwapChain::setWindow(RenderWindow renderWindow) {
+#   if defined(__ANDROID__) && !defined(PLUME_SDL_VULKAN_ENABLED)
+        // Android destroys the old ANativeWindow when the app is backgrounded: drop everything tied to it, then create a
+        // surface on the new window. vk stays null until the next resize().
+        VulkanInterface *renderInterface = commandQueue->device->renderInterface;
+        releaseImageViews();
+        releaseSwapChain();
+        if (surface != VK_NULL_HANDLE) {
+            vkDestroySurfaceKHR(renderInterface->instance, surface, nullptr);
+            surface = VK_NULL_HANDLE;
+        }
+        width = 0;
+        height = 0;
+        desc.renderWindow = renderWindow;
+        if (renderWindow == nullptr) {
+            return false;
+        }
+        VkAndroidSurfaceCreateInfoKHR surfaceCreateInfo = {};
+        surfaceCreateInfo.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+        surfaceCreateInfo.window = renderWindow;
+        VkResult res = vkCreateAndroidSurfaceKHR(renderInterface->instance, &surfaceCreateInfo, nullptr, &surface);
+        if (res != VK_SUCCESS) {
+            fprintf(stderr, "vkCreateAndroidSurfaceKHR failed with error code 0x%X.\n", res);
+            return false;
+        }
+        return true;
+#   else
+        (void)renderWindow;
+        return false;
+#   endif
+    }
+
     void VulkanSwapChain::getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const {
+#   if defined(__ANDROID__) && !defined(PLUME_SDL_VULKAN_ENABLED)
+        if (desc.renderWindow == nullptr) {
+            dstWidth = 0;
+            dstHeight = 0;
+            return;
+        }
+#   endif
 #   if defined(_WIN64)
         RECT rect;
         GetClientRect(desc.renderWindow, &rect);

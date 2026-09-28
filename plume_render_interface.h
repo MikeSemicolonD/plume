@@ -103,6 +103,9 @@ namespace plume {
 
         // Only valid if displayTiming is enabled in capabilities.
         virtual uint32_t getRefreshRate() const = 0;
+
+        // Moves the swap chain to a new native window (Android recreates its surface on resume). The next resize() rebuilds it.
+        virtual bool setWindow(RenderWindow renderWindow) { (void)renderWindow; return false; }
     };
 
     struct RenderFramebuffer {
