@@ -9,6 +9,7 @@
 
 #include "plume_render_interface.h"
 
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -418,9 +419,14 @@ namespace plume {
         std::unique_ptr<RenderBuffer> nullBuffer;
         bool loadStoreOpNoneSupported = false;
         bool nullDescriptorSupported = false;
+        std::atomic<bool> lost{ false };
 
         VulkanDevice(VulkanInterface *renderInterface, const std::string &preferredDeviceName);
         ~VulkanDevice() override;
+        bool isLost() const override { return lost.load(std::memory_order_acquire); }
+
+        // Records VK_ERROR_DEVICE_LOST once; returns true when res is a device loss.
+        bool checkLost(VkResult res);
         std::unique_ptr<RenderDescriptorSet> createDescriptorSet(const RenderDescriptorSetDesc &desc) override;
         std::unique_ptr<RenderShader> createShader(const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) override;
         std::unique_ptr<RenderSampler> createSampler(const RenderSamplerDesc &desc) override;

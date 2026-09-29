@@ -87,6 +87,7 @@ namespace plume {
         VK_KHR_PRESENT_ID_EXTENSION_NAME,
         VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
         VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
+        VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME,
         // Vulkan spec requires this to be enabled if supported by the driver.
         VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
     };
@@ -2253,6 +2254,29 @@ namespace plume {
         commandQueue->swapChains.erase(this);
     }
 
+    // ROGUESQ_LOG_SWAPCHAIN=1: log every change in acquire/present result codes and every swapchain (re)creation.
+    static bool logSwapChainEvents() {
+        static const bool enabled = []() {
+            const char *v = std::getenv("ROGUESQ_LOG_SWAPCHAIN");
+            return (v != nullptr) && (v[0] != '\0') && (v[0] != '0');
+        }();
+        return enabled;
+    }
+
+    static void logSwapChainResult(const char *what, VkResult res, uint32_t index) {
+        if (!logSwapChainEvents()) {
+            return;
+        }
+
+        static thread_local VkResult lastAcquire = VK_SUCCESS;
+        static thread_local VkResult lastPresent = VK_SUCCESS;
+        VkResult &last = (what[0] == 'a') ? lastAcquire : lastPresent;
+        if (res != last) {
+            fprintf(stderr, "[swapchain] %s result %d (was %d) image=%u\n", what, int(res), int(last), index);
+            last = res;
+        }
+    }
+
     bool VulkanSwapChain::present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) {
         thread_local std::vector<VkSemaphore> waitSemaphoresVector;
         waitSemaphoresVector.clear();
@@ -2285,6 +2309,12 @@ namespace plume {
             const std::scoped_lock queueLock(*commandQueue->queue->mutex);
             res = vkQueuePresentKHR(commandQueue->queue->vk, &presentInfo);
         }
+
+        if (commandQueue->device->checkLost(res)) {
+            return false;
+        }
+
+        logSwapChainResult("present", res, textureIndex);
 
 #if defined(__APPLE__)
         // Under MoltenVK, VK_SUBOPTIMAL_KHR does not result in a valid state for rendering. We intentionally
@@ -2365,6 +2395,10 @@ namespace plume {
         }
 
         desc.textureCount = retrievedImageCount;
+        if (logSwapChainEvents()) {
+            fprintf(stderr, "[swapchain] created %ux%u images=%u (min requested %u) presentMode=%d transform=%d\n",
+                width, height, retrievedImageCount, createInfo.minImageCount, int(createInfo.presentMode), int(createInfo.preTransform));
+        }
 
         std::vector<VkImage> images(desc.textureCount);
         res = vkGetSwapchainImagesKHR(commandQueue->device->vk, vk, &desc.textureCount, images.data());
@@ -2522,7 +2556,16 @@ namespace plume {
         assert(signalSemaphore != nullptr);
 
         VulkanCommandSemaphore *interfaceSemaphore = static_cast<VulkanCommandSemaphore *>(signalSemaphore);
+        if (commandQueue->device->isLost()) {
+            return false;
+        }
+
         VkResult res = vkAcquireNextImageKHR(commandQueue->device->vk, vk, UINT64_MAX, interfaceSemaphore->vk, VK_NULL_HANDLE, textureIndex);
+        logSwapChainResult("acquire", res, *textureIndex);
+        if (commandQueue->device->checkLost(res)) {
+            return false;
+        }
+
         if ((res != VK_SUCCESS) && (res != VK_SUBOPTIMAL_KHR)) {
             return false;
         }
@@ -2910,6 +2953,16 @@ namespace plume {
             imageMemoryBarrier.subresourceRange.aspectMask = toAspectFlags(interfaceTexture->desc.format, interfaceTexture->desc.flags);
             imageMemoryBarriers.emplace_back(imageMemoryBarrier);
             srcStageMask |= toStageFlags(interfaceTexture->barrierStages, geometryEnabled, rtEnabled);
+
+            // Acquire semaphores are waited at COLOR_ATTACHMENT_OUTPUT; a swapchain image's transition must chain after that wait or it can rewrite the image while the compositor still reads it.
+            static const bool s_noAcquireBarrierFix = []() {
+                const char *v = std::getenv("ROGUESQ_NO_ACQUIRE_BARRIER_FIX");
+                return (v != nullptr) && (v[0] != '\0') && (v[0] != '0');
+            }();
+            if (!s_noAcquireBarrierFix && ((imageMemoryBarrier.oldLayout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) || (imageMemoryBarrier.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED))) {
+                srcStageMask |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            }
+
             interfaceTexture->textureLayout = textureBarrier.layout;
             interfaceTexture->barrierStages = stages;
         }
@@ -3655,10 +3708,29 @@ namespace plume {
             submitFence = interfaceFence->vk;
         }
 
+        if (device->isLost()) {
+            return;
+        }
+
+        // ROGUESQ_TEST_DEVICE_LOST_AT_SUBMIT=<n>: report the device lost on the n-th submit (once per process) to exercise recovery.
+        static const long long s_testLostAt = []() {
+            const char *v = std::getenv("ROGUESQ_TEST_DEVICE_LOST_AT_SUBMIT");
+            return (v != nullptr) ? std::atoll(v) : 0LL;
+        }();
+        static std::atomic<long long> s_submitCount{ 0 };
+        if ((s_testLostAt > 0) && (s_submitCount.fetch_add(1) + 1 == s_testLostAt)) {
+            device->checkLost(VK_ERROR_DEVICE_LOST);
+            return;
+        }
+
         VkResult res;
         {
             const std::scoped_lock queueLock(*queue->mutex);
             res = vkQueueSubmit(queue->vk, 1, &submitInfo, submitFence);
+        }
+
+        if (device->checkLost(res)) {
+            return;
         }
 
         if (res != VK_SUCCESS) {
@@ -3666,12 +3738,20 @@ namespace plume {
             return;
         }
     }
-    
+
     void VulkanCommandQueue::waitForCommandFence(RenderCommandFence *fence) {
         assert(fence != nullptr);
 
+        if (device->isLost()) {
+            return;
+        }
+
         VulkanCommandFence *interfaceFence = static_cast<VulkanCommandFence *>(fence);
         VkResult res = vkWaitForFences(device->vk, 1, &interfaceFence->vk, VK_TRUE, UINT64_MAX);
+        if (device->checkLost(res)) {
+            return;
+        }
+
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkWaitForFences failed with error code 0x%X.\n", res);
             return;
@@ -4055,10 +4135,32 @@ namespace plume {
         std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
         std::vector<float> queuePriorities(MaxQueuesPerFamilyCount, 1.0f);
         queueCreateInfos.reserve(queueFamilyCount);
+
+        // ROGUESQ_VK_QUEUE_PRIORITY=low|medium|high|realtime|default: system-wide queue priority (VK_EXT_global_priority).
+        // Android defaults to high: at the implicit default priority, screen recording (GPU composition + encoder) makes Adreno 750 fault our context into VK_ERROR_DEVICE_LOST.
+        VkDeviceQueueGlobalPriorityCreateInfoEXT globalPriorityInfo = {};
+        globalPriorityInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT;
+        bool useGlobalPriority = false;
+        if (supportedOptionalExtensions.find(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME) != supportedOptionalExtensions.end()) {
+            const char *priorityEnv = std::getenv("ROGUESQ_VK_QUEUE_PRIORITY");
+#   if defined(__ANDROID__)
+            const std::string priority = ((priorityEnv != nullptr) && (priorityEnv[0] != '\0')) ? priorityEnv : "high";
+#   else
+            const std::string priority = (priorityEnv != nullptr) ? priorityEnv : "";
+#   endif
+            useGlobalPriority = true;
+            if (priority == "low") globalPriorityInfo.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_LOW_EXT;
+            else if (priority == "medium") globalPriorityInfo.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT;
+            else if (priority == "high") globalPriorityInfo.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT;
+            else if (priority == "realtime") globalPriorityInfo.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_REALTIME_EXT;
+            else useGlobalPriority = false;
+        }
+
         for (uint32_t i = 0; i < queueFamilyCount; i++) {
             if (queueFamilyUsed[i]) {
                 VkDeviceQueueCreateInfo queueCreateInfo = {};
                 queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+                queueCreateInfo.pNext = useGlobalPriority ? &globalPriorityInfo : nullptr;
                 queueCreateInfo.queueCount = std::min(queueFamilyProperties[i].queueCount, MaxQueuesPerFamilyCount);
                 queueCreateInfo.queueFamilyIndex = i;
                 queueCreateInfo.pQueuePriorities = queuePriorities.data();
@@ -4086,6 +4188,19 @@ namespace plume {
         createInfo.pEnabledFeatures = &deviceFeatures.features;
 
         VkResult res = vkCreateDevice(physicalDevice, &createInfo, nullptr, &vk);
+        if (useGlobalPriority) {
+            fprintf(stderr, "[plume] queue global priority %d requested: vkCreateDevice result %d\n", int(globalPriorityInfo.globalPriority), int(res));
+        }
+
+        // The requested global priority may be refused (e.g. NOT_PERMITTED for realtime); retry at the default priority.
+        if (useGlobalPriority && (res != VK_SUCCESS)) {
+            for (VkDeviceQueueCreateInfo &queueCreateInfo : queueCreateInfos) {
+                queueCreateInfo.pNext = nullptr;
+            }
+
+            res = vkCreateDevice(physicalDevice, &createInfo, nullptr, &vk);
+        }
+
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateDevice failed with error code 0x%X.\n", res);
             return;
@@ -4190,6 +4305,18 @@ namespace plume {
         if (!nullDescriptorSupported) {
             nullBuffer = createBuffer(RenderBufferDesc::DefaultBuffer(16, RenderBufferFlag::VERTEX));
         }
+    }
+
+    bool VulkanDevice::checkLost(VkResult res) {
+        if (res != VK_ERROR_DEVICE_LOST) {
+            return false;
+        }
+
+        if (!lost.exchange(true, std::memory_order_acq_rel)) {
+            fprintf(stderr, "[plume] VK_ERROR_DEVICE_LOST: device marked lost, further submits are skipped.\n");
+        }
+
+        return true;
     }
 
     VulkanDevice::~VulkanDevice() {

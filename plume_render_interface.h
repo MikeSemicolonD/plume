@@ -228,6 +228,9 @@ namespace plume {
 
     struct RenderDevice {
         virtual ~RenderDevice() { }
+
+        // True once the backend reported the device lost; the device is unusable and must be recreated.
+        virtual bool isLost() const { return false; }
         virtual std::unique_ptr<RenderDescriptorSet> createDescriptorSet(const RenderDescriptorSetDesc &desc) = 0;
         virtual std::unique_ptr<RenderShader> createShader(const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) = 0;
         virtual std::unique_ptr<RenderSampler> createSampler(const RenderSamplerDesc &desc) = 0;
