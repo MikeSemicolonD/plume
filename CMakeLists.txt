@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+if (NOT RT64_STATIC)
+    set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+endif()
 
 if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     # 10.15 because of our use of supportsFamily()
@@ -87,6 +89,10 @@ if(WIN32)
     target_include_directories(plume PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/contrib/D3D12MemoryAllocator/include
     )
+endif()
+
+if(WIN32)
+    target_compile_definitions(plume PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 if(PLUME_SDL_VULKAN_ENABLED)

@@ -30,7 +30,7 @@
 // RogueSquadron64Recomp: route D3D12 debug-layer messages to stderr so a bad barrier /
 // resource-state (which stalls the driver submit on the hangar frame) is visible without a
 // debugger attached. Registered via ID3D12InfoQueue1 below.
-static void CALLBACK rs64_d3d12_debug_msg(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity,
+[[maybe_unused]] static void CALLBACK rs64_d3d12_debug_msg(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity,
         D3D12_MESSAGE_ID id, LPCSTR desc, void *) {
     const char *s = (severity == D3D12_MESSAGE_SEVERITY_CORRUPTION) ? "CORRUPTION"
                   : (severity == D3D12_MESSAGE_SEVERITY_ERROR) ? "ERROR"
@@ -340,7 +340,7 @@ namespace plume {
         }
     }
     
-    static D3D12_COLOR_WRITE_ENABLE toD3D12(RenderColorWriteEnable enable) {
+    [[maybe_unused]] static D3D12_COLOR_WRITE_ENABLE toD3D12(RenderColorWriteEnable enable) {
         return D3D12_COLOR_WRITE_ENABLE(
             ((uint32_t(enable) & uint32_t(RenderColorWriteEnable::RED)) ? D3D12_COLOR_WRITE_ENABLE_RED : 0x0) |
             ((uint32_t(enable) & uint32_t(RenderColorWriteEnable::GREEN)) ? D3D12_COLOR_WRITE_ENABLE_GREEN : 0x0) |
@@ -1309,7 +1309,7 @@ namespace plume {
     void D3D12DescriptorSet::setAccelerationStructure(uint32_t descriptorIndex, const RenderAccelerationStructure *accelerationStructure) {
         const D3D12AccelerationStructure *interfaceAccelerationStructure = static_cast<const D3D12AccelerationStructure *>(accelerationStructure);
         uint32_t descriptorIndexClamped = std::min(descriptorIndex, descriptorTypeMaxIndex);
-        RenderDescriptorRangeType descriptorType = descriptorTypes[descriptorIndexClamped];
+        [[maybe_unused]] RenderDescriptorRangeType descriptorType = descriptorTypes[descriptorIndexClamped];
         assert((descriptorType == RenderDescriptorRangeType::ACCELERATION_STRUCTURE) && "Incompatible descriptor type.");
 
         if (interfaceAccelerationStructure != nullptr) {
@@ -2200,7 +2200,7 @@ namespace plume {
                 bufferViewVector[i].BufferLocation = (interfaceBuffer != nullptr) ? (interfaceBuffer->d3d->GetGPUVirtualAddress() + renderView.buffer.offset) : 0;
                 bufferViewVector[i].SizeInBytes = renderView.size;
 
-                bool slotFound = false;
+                [[maybe_unused]] bool slotFound = false;
                 for (uint32_t j = 0; j < viewCount; j++) {
                     if (inputSlots[j].index == (startSlot + i)) {
                         bufferViewVector[i].StrideInBytes = inputSlots[j].stride;
@@ -2260,13 +2260,13 @@ namespace plume {
     void D3D12CommandList::setFramebuffer(const RenderFramebuffer *framebuffer) {
         if (framebuffer != nullptr) {
             const D3D12Framebuffer *interfaceFramebuffer = static_cast<const D3D12Framebuffer *>(framebuffer);
-            for (const D3D12Texture *target : interfaceFramebuffer->colorTargets) {
+            for ([[maybe_unused]] const D3D12Texture *target : interfaceFramebuffer->colorTargets) {
                 assert((target->layout == RenderTextureLayout::COLOR_WRITE) && "Color targets must be in color write layout when setting the framebuffer.");
             }
             
             if (interfaceFramebuffer->depthTarget != nullptr) {
-                const bool depthReadLayout = (interfaceFramebuffer->depthTarget->layout == RenderTextureLayout::DEPTH_READ);
-                const bool depthWriteLayout = (interfaceFramebuffer->depthTarget->layout == RenderTextureLayout::DEPTH_WRITE);
+                [[maybe_unused]] const bool depthReadLayout = (interfaceFramebuffer->depthTarget->layout == RenderTextureLayout::DEPTH_READ);
+                [[maybe_unused]] const bool depthWriteLayout = (interfaceFramebuffer->depthTarget->layout == RenderTextureLayout::DEPTH_WRITE);
                 assert((depthReadLayout || depthWriteLayout) && "Depth target must be in depth read or write layout when setting the framebuffer.");
             }
 
@@ -3231,7 +3231,7 @@ namespace plume {
             inputElement.AlignedByteOffset = renderElement.alignedByteOffset;
 
             // Read the corresponding input slot to find the input classification and instance data step rate.
-            bool foundInputSlot = false;
+            [[maybe_unused]] bool foundInputSlot = false;
             D3D12_INPUT_CLASSIFICATION inputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
             uint32_t instanceDataStepRate = 0;
             for (uint32_t j = 0; j < desc.inputSlotsCount; j++) {

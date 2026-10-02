@@ -1037,7 +1037,6 @@ namespace plume {
     }
     
     void VulkanTexture::createImageView(VkFormat format) {
-        VkImageView view = VK_NULL_HANDLE;
         VkImageViewCreateInfo viewInfo = {};
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         viewInfo.image = vk;
@@ -3295,7 +3294,7 @@ namespace plume {
 
         const VulkanTexture *dstTexture = static_cast<const VulkanTexture *>(dstLocation.texture);
         const VulkanTexture *srcTexture = static_cast<const VulkanTexture *>(srcLocation.texture);
-        const VulkanBuffer *dstBuffer = static_cast<const VulkanBuffer *>(dstLocation.buffer);
+        [[maybe_unused]] const VulkanBuffer *dstBuffer = static_cast<const VulkanBuffer *>(dstLocation.buffer);
         const VulkanBuffer *srcBuffer = static_cast<const VulkanBuffer *>(srcLocation.buffer);
         if ((dstLocation.type == RenderTextureCopyType::SUBRESOURCE) && (srcLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT)) {
             assert(dstTexture != nullptr);
