@@ -3813,6 +3813,10 @@ namespace plume {
                 capabilities.geometryShader = true;
                 capabilities.raytracing = rtSupportOption;
                 capabilities.raytracingStateUpdate = rtStateUpdateSupportOption;
+                // The adapter loop only asks for SM 6.0, so query 6.5 separately for inline ray queries.
+                D3D12_FEATURE_DATA_SHADER_MODEL rayQueryShaderModel = { D3D_SHADER_MODEL_6_5 };
+                const bool sm65 = SUCCEEDED(deviceOption->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &rayQueryShaderModel, sizeof(rayQueryShaderModel))) && (rayQueryShaderModel.HighestShaderModel >= D3D_SHADER_MODEL_6_5);
+                capabilities.rayQuery = rtStateUpdateSupportOption && sm65;
                 capabilities.sampleLocations = samplePositionsOption;
                 capabilities.resolveRegion = resolveRegionOption;
                 capabilities.resolveModes = samplePositionsOption; // Resolve modes require sample positions support.

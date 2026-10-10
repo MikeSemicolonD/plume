@@ -1769,6 +1769,9 @@ namespace plume {
         bool raytracing = false;
         bool raytracingStateUpdate = false;
 
+        // Inline ray queries from any shader stage (DXR 1.1 / VK_KHR_ray_query).
+        bool rayQuery = false;
+
         // MSAA.
         bool sampleLocations = false;
 

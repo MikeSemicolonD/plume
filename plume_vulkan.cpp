@@ -82,6 +82,7 @@ namespace plume {
         VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
         VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME,
         VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+        VK_KHR_RAY_QUERY_EXTENSION_NAME,
         VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME,
         VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME,
         VK_KHR_PRESENT_ID_EXTENSION_NAME,
@@ -4011,6 +4012,14 @@ namespace plume {
             featuresChain = &accelerationStructureFeatures;
         }
 
+        VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures = {};
+        const bool rayQueryFound = rayTracingFound && (supportedOptionalExtensions.find(VK_KHR_RAY_QUERY_EXTENSION_NAME) != supportedOptionalExtensions.end());
+        if (rayQueryFound) {
+            rayQueryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+            rayQueryFeatures.pNext = featuresChain;
+            featuresChain = &rayQueryFeatures;
+        }
+
         VkPhysicalDeviceFeatures2 deviceFeatures = {};
         deviceFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         deviceFeatures.pNext = featuresChain;
@@ -4045,6 +4054,12 @@ namespace plume {
 
             accelerationStructureFeatures.pNext = createDeviceChain;
             createDeviceChain = &accelerationStructureFeatures;
+        }
+
+        const bool rayQuerySupported = rayTracingSupported && rayQueryFeatures.rayQuery;
+        if (rayQuerySupported) {
+            rayQueryFeatures.pNext = createDeviceChain;
+            createDeviceChain = &rayQueryFeatures;
         }
 
         const bool descriptorIndexingSupported = indexingFeatures.descriptorBindingPartiallyBound && indexingFeatures.descriptorBindingVariableDescriptorCount && indexingFeatures.runtimeDescriptorArray;
@@ -4273,6 +4288,7 @@ namespace plume {
         capabilities.geometryShader = deviceFeatures.features.geometryShader;
         capabilities.raytracing = rayTracingSupported;
         capabilities.raytracingStateUpdate = false;
+        capabilities.rayQuery = rayQuerySupported;
         capabilities.sampleLocations = (sampleLocationProperties.sampleLocationSampleCounts != 0);
         capabilities.resolveRegion = true;
         capabilities.resolveModes = false;
