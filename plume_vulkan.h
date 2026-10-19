@@ -15,7 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#if defined(_WIN64)
+#if defined(_WIN32)
 #define VK_USE_PLATFORM_WIN32_KHR
 #elif defined(__ANDROID__)
 #define VK_USE_PLATFORM_ANDROID_KHR
@@ -410,6 +410,9 @@ namespace plume {
         VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
         VkPhysicalDeviceProperties physicalDeviceProperties = {};
         VmaAllocator allocator = VK_NULL_HANDLE;
+        VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+        std::mutex pipelineCacheMutex;
+        size_t pipelineCacheSavedSize = 0;
         uint32_t queueFamilyIndices[3] = {};
         std::vector<VulkanQueueFamily> queueFamilies;
         RenderDeviceCapabilities capabilities;
@@ -424,6 +427,7 @@ namespace plume {
         VulkanDevice(VulkanInterface *renderInterface, const std::string &preferredDeviceName);
         ~VulkanDevice() override;
         bool isLost() const override { return lost.load(std::memory_order_acquire); }
+        void savePipelineCache() override;
 
         // Records VK_ERROR_DEVICE_LOST once; returns true when res is a device loss.
         bool checkLost(VkResult res);

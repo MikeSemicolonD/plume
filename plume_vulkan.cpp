@@ -13,6 +13,9 @@
 #include <algorithm>
 #include <cmath>
 #include <climits>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <unordered_map>
 
 #if DLSS_ENABLED
@@ -33,6 +36,9 @@ namespace plume {
     // Required buffer alignment for acceleration structures.
     static const uint64_t AccelerationStructureBufferAlignment = 256;
 
+    // In the working directory, beside the game's other per-machine data.
+    static const char PipelineCacheFileName[] = "vulkan_pipeline_cache.bin";
+
     // Required buffer alignment for shader binding table.
     static const uint64_t ShaderBindingTableAlignment = 256;
 
@@ -48,7 +54,7 @@ namespace plume {
 #   ifdef VULKAN_OBJECT_NAMES_ENABLED
         VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
 #   endif
-#   if defined(_WIN64)
+#   if defined(_WIN32)
         VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
 #   elif defined(__ANDROID__)
         VK_KHR_ANDROID_SURFACE_EXTENSION_NAME,
@@ -911,10 +917,14 @@ namespace plume {
             return nullptr;
         }
 
+        // Host-visible memory may be non-coherent (Raspberry Pi V3D): GPU writes must be invalidated before the CPU reads them. A no-op on coherent memory.
+        vmaInvalidateAllocation(device->allocator, allocation, 0, VK_WHOLE_SIZE);
         return data;
     }
 
     void VulkanBuffer::unmap(uint32_t subresource, const RenderRange *writtenRange) {
+        // And CPU writes must be flushed before the GPU reads them.
+        vmaFlushAllocation(device->allocator, allocation, 0, VK_WHOLE_SIZE);
         vmaUnmapMemory(device->allocator, allocation);
     }
 
@@ -1391,7 +1401,7 @@ namespace plume {
         pipelineInfo.layout = pipelineLayout->vk;
         pipelineInfo.stage = stageInfo;
 
-        VkResult res = vkCreateComputePipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
+        VkResult res = vkCreateComputePipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
             return;
@@ -1650,7 +1660,7 @@ namespace plume {
         pipelineInfo.layout = pipelineLayout->vk;
         pipelineInfo.renderPass = renderPass;
 
-        VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
+        VkResult res = vkCreateGraphicsPipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
             return;
@@ -1856,7 +1866,7 @@ namespace plume {
 
         this->descriptorSetCount = uint32_t(pipelineLayout->descriptorSetLayouts.size());
 
-        VkResult res = vkCreateRayTracingPipelinesKHR(device->vk, nullptr, nullptr, 1, &pipelineInfo, nullptr, &vk);
+        VkResult res = vkCreateRayTracingPipelinesKHR(device->vk, VK_NULL_HANDLE, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateRayTracingPipelinesKHR failed with error code 0x%X.\n", res);
             return;
@@ -2083,7 +2093,7 @@ namespace plume {
 
         VkResult res;
 
-#   ifdef _WIN64
+#   ifdef _WIN32
         assert(desc.renderWindow != 0);
         VkWin32SurfaceCreateInfoKHR surfaceCreateInfo = {};
         surfaceCreateInfo.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
@@ -2528,7 +2538,7 @@ namespace plume {
             return;
         }
 #   endif
-#   if defined(_WIN64)
+#   if defined(_WIN32)
         RECT rect;
         GetClientRect(desc.renderWindow, &rect);
         dstWidth = rect.right - rect.left;
@@ -3295,7 +3305,7 @@ namespace plume {
 
         const VulkanTexture *dstTexture = static_cast<const VulkanTexture *>(dstLocation.texture);
         const VulkanTexture *srcTexture = static_cast<const VulkanTexture *>(srcLocation.texture);
-        [[maybe_unused]] const VulkanBuffer *dstBuffer = static_cast<const VulkanBuffer *>(dstLocation.buffer);
+        const VulkanBuffer *dstBuffer = static_cast<const VulkanBuffer *>(dstLocation.buffer);
         const VulkanBuffer *srcBuffer = static_cast<const VulkanBuffer *>(srcLocation.buffer);
         if ((dstLocation.type == RenderTextureCopyType::SUBRESOURCE) && (srcLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT)) {
             assert(dstTexture != nullptr);
@@ -3317,6 +3327,23 @@ namespace plume {
             imageCopy.imageExtent.height = srcLocation.placedFootprint.height;
             imageCopy.imageExtent.depth = srcLocation.placedFootprint.depth;
             vkCmdCopyBufferToImage(vk, srcBuffer->vk, dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
+        }
+        else if ((dstLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT) && (srcLocation.type == RenderTextureCopyType::SUBRESOURCE)) {
+            assert(dstBuffer != nullptr);
+            assert(srcTexture != nullptr);
+
+            VkBufferImageCopy imageCopy = {};
+            imageCopy.bufferOffset = dstLocation.placedFootprint.offset;
+            imageCopy.bufferRowLength = dstLocation.placedFootprint.rowWidth;
+            imageCopy.bufferImageHeight = dstLocation.placedFootprint.height;
+            imageCopy.imageSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
+            imageCopy.imageSubresource.baseArrayLayer = srcLocation.subresource.arrayIndex;
+            imageCopy.imageSubresource.layerCount = 1;
+            imageCopy.imageSubresource.mipLevel = srcLocation.subresource.mipLevel;
+            imageCopy.imageExtent.width = dstLocation.placedFootprint.width;
+            imageCopy.imageExtent.height = dstLocation.placedFootprint.height;
+            imageCopy.imageExtent.depth = dstLocation.placedFootprint.depth;
+            vkCmdCopyImageToBuffer(vk, srcTexture->vk, toImageLayout(srcTexture->textureLayout), dstBuffer->vk, 1, &imageCopy);
         }
         else {
             VkImageCopy imageCopy = {};
@@ -4262,6 +4289,24 @@ namespace plume {
             return;
         }
 
+        // Some drivers (Mesa v3dv) never hit their own disk cache for these pipelines; the driver ignores data from another GPU or driver version.
+        {
+            std::ifstream cacheFile(PipelineCacheFileName, std::ios::binary);
+            const std::vector<char> cacheData((std::istreambuf_iterator<char>(cacheFile)), std::istreambuf_iterator<char>());
+            VkPipelineCacheCreateInfo cacheInfo = {};
+            cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+            cacheInfo.initialDataSize = cacheData.size();
+            cacheInfo.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
+            if (vkCreatePipelineCache(vk, &cacheInfo, nullptr, &pipelineCache) != VK_SUCCESS) {
+                cacheInfo.initialDataSize = 0;
+                cacheInfo.pInitialData = nullptr;
+                if (vkCreatePipelineCache(vk, &cacheInfo, nullptr, &pipelineCache) != VK_SUCCESS) {
+                    pipelineCache = VK_NULL_HANDLE;
+                }
+            }
+            pipelineCacheSavedSize = cacheData.size();
+        }
+
         // Find the biggest device local memory available on the device.
         VkDeviceSize memoryHeapSize = 0;
         const VkPhysicalDeviceMemoryProperties *memoryProps = nullptr;
@@ -4299,7 +4344,22 @@ namespace plume {
         capabilities.presentWait = presentWaitSupported;
         capabilities.displayTiming = supportedOptionalExtensions.find(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) != supportedOptionalExtensions.end();
         capabilities.maxTextureSize = physicalDeviceProperties.limits.maxImageDimension2D;
-        capabilities.preferHDR = memoryHeapSize > (512 * 1024 * 1024);
+        capabilities.maxTexturesPerStage = physicalDeviceProperties.limits.maxPerStageDescriptorSampledImages;
+        if (descriptorIndexingSupported) {
+            // Bindless arrays are bound by the update-after-bind limit, which is far higher on GPUs that report a small plain one.
+            VkPhysicalDeviceDescriptorIndexingProperties indexingProperties = {};
+            indexingProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES;
+            VkPhysicalDeviceProperties2 indexingProperties2 = {};
+            indexingProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            indexingProperties2.pNext = &indexingProperties;
+            vkGetPhysicalDeviceProperties2(physicalDevice, &indexingProperties2);
+            capabilities.maxTexturesPerStage = std::max(capabilities.maxTexturesPerStage, indexingProperties.maxPerStageDescriptorUpdateAfterBindSampledImages);
+        }
+        // The HDR color buffer is blended, which some GPUs (Raspberry Pi V3D) can't do on 16-bit UNORM.
+        VkFormatProperties hdrFormatProperties = {};
+        vkGetPhysicalDeviceFormatProperties(physicalDevice, VK_FORMAT_R16G16B16A16_UNORM, &hdrFormatProperties);
+        const bool hdrBlendable = (hdrFormatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
+        capabilities.preferHDR = hdrBlendable && (memoryHeapSize > (512 * 1024 * 1024));
         capabilities.dynamicDepthBias = true;
         capabilities.queryPools = true;
         capabilities.uma = (description.type == RenderDeviceType::INTEGRATED) && hasHostVisibleDeviceLocalMemory;
@@ -4610,6 +4670,11 @@ namespace plume {
     void VulkanDevice::release() {
         nullBuffer = nullptr; // force destruction before destroying allocator
 
+        if (pipelineCache != VK_NULL_HANDLE) {
+            vkDestroyPipelineCache(vk, pipelineCache, nullptr);
+            pipelineCache = VK_NULL_HANDLE;
+        }
+
         if (allocator != VK_NULL_HANDLE) {
             vmaDestroyAllocator(allocator);
             allocator = VK_NULL_HANDLE;
@@ -4623,6 +4688,38 @@ namespace plume {
 
     bool VulkanDevice::isValid() const {
         return vk != nullptr;
+    }
+
+    void VulkanDevice::savePipelineCache() {
+        if (pipelineCache == VK_NULL_HANDLE) {
+            return;
+        }
+
+        const std::scoped_lock lock(pipelineCacheMutex);
+        size_t size = 0;
+        if ((vkGetPipelineCacheData(vk, pipelineCache, &size, nullptr) != VK_SUCCESS) || (size == pipelineCacheSavedSize)) {
+            return;
+        }
+
+        std::vector<char> data(size);
+        if (vkGetPipelineCacheData(vk, pipelineCache, &size, data.data()) != VK_SUCCESS) {
+            return;
+        }
+
+        // Written beside and renamed over, so a crash mid-write never leaves a truncated cache.
+        const std::string tempName = std::string(PipelineCacheFileName) + ".tmp";
+        {
+            std::ofstream out(tempName, std::ios::binary | std::ios::trunc);
+            if (!out.write(data.data(), std::streamsize(size))) {
+                return;
+            }
+        }
+
+        std::error_code ec;
+        std::filesystem::rename(tempName, PipelineCacheFileName, ec);
+        if (!ec) {
+            pipelineCacheSavedSize = size;
+        }
     }
 
     bool VulkanDevice::beginCapture() {

@@ -72,6 +72,12 @@ elseif(WIN32)
         plume_d3d12.h
         ${CMAKE_CURRENT_SOURCE_DIR}/contrib/D3D12MemoryAllocator/src/D3D12MemAlloc.cpp
     )
+    if(TARGET spirv-cross-hlsl)
+        list(APPEND PLUME_SOURCES
+            plume_d3d11.cpp
+            plume_d3d11.h
+        )
+    endif()
 endif()
 
 # Create target
@@ -93,6 +99,11 @@ endif()
 
 if(WIN32)
     target_compile_definitions(plume PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+if(WIN32 AND TARGET spirv-cross-hlsl)
+    target_compile_definitions(plume PUBLIC PLUME_D3D11_ENABLED)
+    target_link_libraries(plume PRIVATE spirv-cross-hlsl spirv-cross-glsl spirv-cross-core d3d11 dxgi d3dcompiler dxguid)
 endif()
 
 if(PLUME_SDL_VULKAN_ENABLED)

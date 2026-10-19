@@ -904,7 +904,7 @@ namespace plume {
     D3D12_CPU_DESCRIPTOR_HANDLE D3D12DescriptorHeapAllocator::getCPUHandleAt(uint32_t index) const {
         assert(index < heapSize);
         assert(cpuDescriptorHandle.ptr > 0);
-        return { cpuDescriptorHandle.ptr + uint64_t(index) * descriptorHandleIncrement };
+        return { cpuDescriptorHandle.ptr + SIZE_T(index) * descriptorHandleIncrement };
     }
 
     D3D12_GPU_DESCRIPTOR_HANDLE D3D12DescriptorHeapAllocator::getGPUHandleAt(uint32_t index) const {
@@ -2357,9 +2357,15 @@ namespace plume {
 
         const D3D12_TEXTURE_COPY_LOCATION copyDstLocation = toD3D12(dstLocation);
         const D3D12_TEXTURE_COPY_LOCATION copySrcLocation = toD3D12(srcLocation);
-        setSamplePositions(dstLocation.texture);
+        // Texture-to-buffer copies have no destination texture.
+        if (dstLocation.texture != nullptr) {
+            setSamplePositions(dstLocation.texture);
+        }
+
         d3d->CopyTextureRegion(&copyDstLocation, dstX, dstY, dstZ, &copySrcLocation, (srcBox != nullptr) ? &copyBox : nullptr);
-        resetSamplePositions();
+        if (dstLocation.texture != nullptr) {
+            resetSamplePositions();
+        }
     }
 
     void D3D12CommandList::copyBuffer(const RenderBuffer *dstBuffer, const RenderBuffer *srcBuffer) {
