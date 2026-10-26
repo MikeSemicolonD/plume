@@ -3261,7 +3261,11 @@ namespace plume {
 
         psoDesc.InputLayout = { inputElements.data(), UINT(inputElements.size()) };
 
-        device->d3d->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
+        const HRESULT res = device->d3d->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
+        if (FAILED(res)) {
+            fprintf(stderr, "CreateGraphicsPipelineState failed with error code 0x%lX (VS %zu bytes, PS %zu bytes, %u render targets).\n", res, size_t(psoDesc.VS.BytecodeLength), size_t(psoDesc.PS.BytecodeLength), psoDesc.NumRenderTargets);
+            d3d = nullptr;
+        }
     }
 
     D3D12GraphicsPipeline::~D3D12GraphicsPipeline() {
