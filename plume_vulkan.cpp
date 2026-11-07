@@ -11,12 +11,17 @@
 #include "plume_vulkan.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <climits>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <unordered_map>
+
+#if !defined(_WIN32)
+#   include <pthread.h>
+#endif
 
 #if DLSS_ENABLED
 #   include "render/plume_dlss.h"
@@ -1291,6 +1296,38 @@ namespace plume {
         }
     }
 
+    // ROGUESQ_LOG_SLOW_PIPELINES=<ms> (1 = 20 ms): log each pipeline that takes at least that long to create, with the creating thread and its shaders.
+    static int slowPipelineMs() {
+        static const int ms = []() {
+            const char *v = std::getenv("ROGUESQ_LOG_SLOW_PIPELINES");
+            const int n = (v != nullptr) ? std::atoi(v) : 0;
+            return (n == 1) ? 20 : n;
+        }();
+        return ms;
+    }
+
+    static void logSlowPipeline(std::chrono::steady_clock::time_point start, const char *kind, const VulkanShader *a, const VulkanShader *b, uint32_t samples) {
+        if (slowPipelineMs() <= 0) {
+            return;
+        }
+
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (ms < slowPipelineMs()) {
+            return;
+        }
+
+        char thread[32] = "?";
+#   if defined(__linux__) || defined(__ANDROID__) || defined(__APPLE__)
+        pthread_getname_np(pthread_self(), thread, sizeof(thread));
+#   elif defined(_WIN32)
+        std::snprintf(thread, sizeof(thread), "tid %lu", GetCurrentThreadId());
+#   endif
+
+        std::fprintf(stderr, "[pipeline] %.1f ms %s thread=%s %s/%llu %s/%llu samples=%u\n", ms, kind, thread,
+            (a != nullptr) ? a->entryPointName.c_str() : "-", (a != nullptr) ? (unsigned long long)a->size : 0ULL,
+            (b != nullptr) ? b->entryPointName.c_str() : "-", (b != nullptr) ? (unsigned long long)b->size : 0ULL, samples);
+    }
+
     // VulkanShader
 
     VulkanShader::VulkanShader(VulkanDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) {
@@ -1303,6 +1340,7 @@ namespace plume {
         this->device = device;
         this->format = format;
         this->entryPointName = (entryPointName != nullptr) ? std::string(entryPointName) : std::string();
+        this->size = size;
 
         VkShaderModuleCreateInfo shaderInfo = {};
         shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -1401,7 +1439,9 @@ namespace plume {
         pipelineInfo.layout = pipelineLayout->vk;
         pipelineInfo.stage = stageInfo;
 
+        const auto start = std::chrono::steady_clock::now();
         VkResult res = vkCreateComputePipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
+        logSlowPipeline(start, "compute", computeShader, nullptr, 1);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
             return;
@@ -1660,7 +1700,9 @@ namespace plume {
         pipelineInfo.layout = pipelineLayout->vk;
         pipelineInfo.renderPass = renderPass;
 
+        const auto start = std::chrono::steady_clock::now();
         VkResult res = vkCreateGraphicsPipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
+        logSlowPipeline(start, "graphics", static_cast<const VulkanShader *>(desc.vertexShader), static_cast<const VulkanShader *>(desc.pixelShader), uint32_t(multisampling.rasterizationSamples));
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
             return;

@@ -142,6 +142,7 @@ namespace plume {
     struct VulkanShader : RenderShader {
         VkShaderModule vk = VK_NULL_HANDLE;
         std::string entryPointName;
+        uint64_t size = 0;
         VulkanDevice *device = nullptr;
         RenderShaderFormat format = RenderShaderFormat::UNKNOWN;
 
