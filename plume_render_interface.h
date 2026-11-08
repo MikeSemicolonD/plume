@@ -233,6 +233,8 @@ namespace plume {
         virtual bool isLost() const { return false; }
         // Writes the driver's compiled pipelines to disk so the next run skips compiling them; backends without such a cache do nothing.
         virtual void savePipelineCache() { }
+        // GPU memory per heap: what the allocator holds in blocks, what is allocated in them, and the driver's process usage and budget; empty without an allocator.
+        virtual std::string memoryStats() { return {}; }
         virtual std::unique_ptr<RenderDescriptorSet> createDescriptorSet(const RenderDescriptorSetDesc &desc) = 0;
         virtual std::unique_ptr<RenderShader> createShader(const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) = 0;
         virtual std::unique_ptr<RenderSampler> createSampler(const RenderSamplerDesc &desc) = 0;

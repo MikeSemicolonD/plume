@@ -429,6 +429,7 @@ namespace plume {
         ~VulkanDevice() override;
         bool isLost() const override { return lost.load(std::memory_order_acquire); }
         void savePipelineCache() override;
+        std::string memoryStats() override;
 
         // Records VK_ERROR_DEVICE_LOST once; returns true when res is a device loss.
         bool checkLost(VkResult res);

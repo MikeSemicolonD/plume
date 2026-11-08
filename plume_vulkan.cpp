@@ -4732,6 +4732,30 @@ namespace plume {
         return vk != nullptr;
     }
 
+    std::string VulkanDevice::memoryStats() {
+        if (allocator == VK_NULL_HANDLE) {
+            return {};
+        }
+
+        VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+        vmaGetHeapBudgets(allocator, budgets);
+
+        const VkPhysicalDeviceMemoryProperties *props = nullptr;
+        vmaGetMemoryProperties(allocator, &props);
+
+        std::string out;
+        for (uint32_t i = 0; i < props->memoryHeapCount; ++i) {
+            const VmaBudget &b = budgets[i];
+            const bool local = (props->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+            char line[192];
+            snprintf(line, sizeof(line), "%sheap%u(%s) blocks=%u/%.1fMB allocs=%u/%.1fMB usage=%.1fMB budget=%.1fMB", out.empty() ? "" : " | ", i, local ? "local" : "system",
+                b.statistics.blockCount, b.statistics.blockBytes / 1048576.0, b.statistics.allocationCount, b.statistics.allocationBytes / 1048576.0, b.usage / 1048576.0, b.budget / 1048576.0);
+            out += line;
+        }
+
+        return out;
+    }
+
     void VulkanDevice::savePipelineCache() {
         if (pipelineCache == VK_NULL_HANDLE) {
             return;

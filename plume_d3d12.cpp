@@ -3981,6 +3981,27 @@ namespace plume {
         }
     }
 
+    std::string D3D12Device::memoryStats() {
+        if (allocator == nullptr) {
+            return {};
+        }
+
+        D3D12MA::Budget budgets[2] = {};
+        allocator->GetBudget(&budgets[0], &budgets[1]);
+
+        std::string out;
+        const char *names[2] = { "local", "system" };
+        for (int i = 0; i < 2; ++i) {
+            const D3D12MA::Budget &b = budgets[i];
+            char line[192];
+            snprintf(line, sizeof(line), "%s%s blocks=%u/%.1fMB allocs=%u/%.1fMB usage=%.1fMB budget=%.1fMB", (i > 0) ? " | " : "", names[i],
+                b.Stats.BlockCount, b.Stats.BlockBytes / 1048576.0, b.Stats.AllocationCount, b.Stats.AllocationBytes / 1048576.0, b.UsageBytes / 1048576.0, b.BudgetBytes / 1048576.0);
+            out += line;
+        }
+
+        return out;
+    }
+
     D3D12Device::~D3D12Device() {
         viewHeapAllocator.reset();
         samplerHeapAllocator.reset();
