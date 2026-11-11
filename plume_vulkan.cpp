@@ -82,6 +82,9 @@ namespace plume {
     static const std::unordered_set<std::string> RequiredDeviceExtensions = {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
     };
+
+    // Set by SetVulkanCreateHooks before the instance and device are created.
+    static VulkanCreateHooks createHooks;
     
     static const std::unordered_set<std::string> OptionalDeviceExtensions = {
         VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
@@ -3971,6 +3974,18 @@ namespace plume {
             }
         }
 
+        // OpenXR names the GPU the headset is attached to.
+        const VkPhysicalDevice requiredDevice = createHooks.pickPhysicalDevice ? createHooks.pickPhysicalDevice(renderInterface->instance) : VK_NULL_HANDLE;
+        if (requiredDevice != VK_NULL_HANDLE) {
+            VkPhysicalDeviceProperties deviceProperties;
+            vkGetPhysicalDeviceProperties(requiredDevice, &deviceProperties);
+            physicalDevice = requiredDevice;
+            description.name = deviceProperties.deviceName;
+            description.type = toDeviceType(deviceProperties.deviceType);
+            description.driverVersion = deviceProperties.driverVersion;
+            description.vendor = RenderDeviceVendor(deviceProperties.vendorID);
+        }
+
         if (physicalDevice == VK_NULL_HANDLE) {
             fprintf(stderr, "Unable to find a device with the required features.\n");
             return;
@@ -4259,6 +4274,12 @@ namespace plume {
 
         for (const std::string &extension : supportedOptionalExtensions) {
             enabledExtensions.push_back(extension.c_str());
+        }
+
+        for (const std::string &extension : createHooks.deviceExtensions) {
+            if ((RequiredDeviceExtensions.count(extension) == 0) && (supportedOptionalExtensions.count(extension) == 0)) {
+                enabledExtensions.push_back(extension.c_str());
+            }
         }
 
         VkDeviceCreateInfo createInfo = {};
@@ -4859,6 +4880,10 @@ namespace plume {
         }
 #   endif
 
+        for (const std::string &extension : createHooks.instanceExtensions) {
+            requiredExtensions.insert(extension);
+        }
+
         std::unordered_set<std::string> missingRequiredExtensions = requiredExtensions;
         for (uint32_t i = 0; i < extensionCount; i++) {
             const std::string extensionName(availableExtensions[i].extensionName);
@@ -4964,6 +4989,43 @@ namespace plume {
 
     bool VulkanInterface::isValid() const {
         return instance != nullptr;
+    }
+
+    // External requirements (OpenXR).
+
+    void SetVulkanCreateHooks(const VulkanCreateHooks &hooks) {
+        createHooks = hooks;
+    }
+
+    VulkanNativeHandles GetVulkanNativeHandles(RenderDevice *device, RenderCommandQueue *commandQueue) {
+        VulkanNativeHandles handles;
+        VulkanDevice *vulkanDevice = static_cast<VulkanDevice *>(device);
+        VulkanCommandQueue *vulkanQueue = static_cast<VulkanCommandQueue *>(commandQueue);
+        handles.instance = vulkanDevice->renderInterface->instance;
+        handles.physicalDevice = vulkanDevice->physicalDevice;
+        handles.device = vulkanDevice->vk;
+        handles.queue = vulkanQueue->queue->vk;
+        handles.queueFamily = vulkanQueue->familyIndex;
+        handles.queueIndex = vulkanQueue->queueIndex;
+        handles.queueMutex = vulkanQueue->queue->mutex.get();
+        return handles;
+    }
+
+    std::unique_ptr<RenderTexture> WrapVulkanImage(RenderDevice *device, VkImage image, RenderFormat format, uint32_t width, uint32_t height) {
+        std::unique_ptr<VulkanTexture> texture = std::make_unique<VulkanTexture>(static_cast<VulkanDevice *>(device), image);
+        texture->desc.dimension = RenderTextureDimension::TEXTURE_2D;
+        texture->desc.format = format;
+        texture->desc.width = width;
+        texture->desc.height = height;
+        texture->desc.depth = 1;
+        texture->desc.mipLevels = 1;
+        texture->desc.arraySize = 1;
+        texture->desc.flags = RenderTextureFlag::RENDER_TARGET;
+        texture->fillSubresourceRange();
+
+        // OpenXR hands its images over in COLOR_ATTACHMENT_OPTIMAL and wants them back that way; only copies write them, so no view is made.
+        texture->textureLayout = RenderTextureLayout::COLOR_WRITE;
+        return texture;
     }
 
     // Global creation function.

@@ -10,6 +10,7 @@
 #include "plume_render_interface.h"
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -479,4 +480,29 @@ namespace plume {
         const std::vector<std::string> &getDeviceNames() const override;
         bool isValid() const;
     };
+
+    // Requirements from an external API (OpenXR) applied to the next instance and device plume creates.
+    struct VulkanCreateHooks {
+        std::vector<std::string> instanceExtensions;
+        std::vector<std::string> deviceExtensions;
+        std::function<VkPhysicalDevice(VkInstance)> pickPhysicalDevice;
+    };
+
+    void SetVulkanCreateHooks(const VulkanCreateHooks &hooks);
+
+    // The native objects behind a device and one of its command queues; queueMutex guards every use of that VkQueue.
+    struct VulkanNativeHandles {
+        VkInstance instance = VK_NULL_HANDLE;
+        VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+        VkDevice device = VK_NULL_HANDLE;
+        VkQueue queue = VK_NULL_HANDLE;
+        uint32_t queueFamily = 0;
+        uint32_t queueIndex = 0;
+        std::mutex *queueMutex = nullptr;
+    };
+
+    VulkanNativeHandles GetVulkanNativeHandles(RenderDevice *device, RenderCommandQueue *commandQueue);
+
+    // Wraps an image owned by someone else (an OpenXR swapchain image, in COLOR_ATTACHMENT_OPTIMAL) for use as a copy destination.
+    std::unique_ptr<RenderTexture> WrapVulkanImage(RenderDevice *device, VkImage image, RenderFormat format, uint32_t width, uint32_t height);
 };
