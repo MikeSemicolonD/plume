@@ -260,7 +260,7 @@ namespace plume {
         D3D12Device *device = nullptr;
         RenderCommandListType type = RenderCommandListType::UNKNOWN;
 
-        D3D12CommandQueue(D3D12Device *device, RenderCommandListType type);
+        D3D12CommandQueue(D3D12Device *device, RenderCommandListType type, bool highPriority = false);
         ~D3D12CommandQueue() override;
         std::unique_ptr<RenderCommandList> createCommandList() override;
         std::unique_ptr<RenderSwapChain> createSwapChain(const RenderSwapChainDesc &desc) override;
@@ -459,6 +459,7 @@ namespace plume {
         std::unique_ptr<RenderPipeline> createGraphicsPipeline(const RenderGraphicsPipelineDesc &desc) override;
         std::unique_ptr<RenderPipeline> createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) override;
         std::unique_ptr<RenderCommandQueue> createCommandQueue(RenderCommandListType type) override;
+        std::unique_ptr<RenderCommandQueue> createHighPriorityCommandQueue(RenderCommandListType type) override;
         std::unique_ptr<RenderBuffer> createBuffer(const RenderBufferDesc &desc) override;
         std::unique_ptr<RenderTexture> createTexture(const RenderTextureDesc &desc) override;
         std::unique_ptr<RenderAccelerationStructure> createAccelerationStructure(const RenderAccelerationStructureDesc &desc) override;

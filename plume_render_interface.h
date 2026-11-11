@@ -242,6 +242,9 @@ namespace plume {
         virtual std::unique_ptr<RenderPipeline> createGraphicsPipeline(const RenderGraphicsPipelineDesc &desc) = 0;
         virtual std::unique_ptr<RenderPipeline> createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline = nullptr) = 0;
         virtual std::unique_ptr<RenderCommandQueue> createCommandQueue(RenderCommandListType type) = 0;
+
+        // RS64: a queue the GPU schedules ahead of normal ones where the backend supports it (D3D12), a normal queue elsewhere.
+        virtual std::unique_ptr<RenderCommandQueue> createHighPriorityCommandQueue(RenderCommandListType type) { return createCommandQueue(type); }
         virtual std::unique_ptr<RenderBuffer> createBuffer(const RenderBufferDesc &desc) = 0;
         virtual std::unique_ptr<RenderTexture> createTexture(const RenderTextureDesc &desc) = 0;
         virtual std::unique_ptr<RenderAccelerationStructure> createAccelerationStructure(const RenderAccelerationStructureDesc &desc) = 0;

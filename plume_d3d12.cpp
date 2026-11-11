@@ -2680,14 +2680,14 @@ namespace plume {
 
     // D3D12CommandQueue
 
-    D3D12CommandQueue::D3D12CommandQueue(D3D12Device *device, RenderCommandListType type) {
+    D3D12CommandQueue::D3D12CommandQueue(D3D12Device *device, RenderCommandListType type, bool highPriority) {
         assert(device != nullptr);
 
         this->device = device;
         this->type = type;
 
         D3D12_COMMAND_QUEUE_DESC queueDesc = { };
-        queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+        queueDesc.Priority = highPriority ? D3D12_COMMAND_QUEUE_PRIORITY_HIGH : D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
         queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
         queueDesc.NodeMask = 0;
 
@@ -4036,6 +4036,10 @@ namespace plume {
 
     std::unique_ptr<RenderCommandQueue> D3D12Device::createCommandQueue(RenderCommandListType type) {
         return std::make_unique<D3D12CommandQueue>(this, type);
+    }
+
+    std::unique_ptr<RenderCommandQueue> D3D12Device::createHighPriorityCommandQueue(RenderCommandListType type) {
+        return std::make_unique<D3D12CommandQueue>(this, type, true);
     }
     
     std::unique_ptr<RenderBuffer> D3D12Device::createBuffer(const RenderBufferDesc &desc) {
