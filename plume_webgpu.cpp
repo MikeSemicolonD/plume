@@ -2353,9 +2353,14 @@ namespace plume {
 
         // Like a vsync'd present, wait for the browser's next animation frame: it paces the render threads, which would otherwise flood the
         // main thread with work and keep the page from ever drawing.
-        // Hidden tabs get no animation frames, so a timer ends the wait there.
+        // A hidden page gets no animation frames and its timers run about once a second, so it doesn't wait (the game keeps its own pace, a co-op partner keeps up).
         if (vsyncEnabled && !emscripten_is_main_runtime_thread()) {
             webgpuRunOnMainAsync([](std::function<void()> done) {
+                if (EM_ASM_INT({ return document.hidden ? 1 : 0; })) {
+                    done();
+                    return;
+                }
+
                 struct Wait {
                     std::function<void()> done;
                     int pending = 2;
