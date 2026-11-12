@@ -80,8 +80,21 @@ elseif(WIN32)
     endif()
 endif()
 
+if(EMSCRIPTEN)
+    list(APPEND PLUME_SOURCES
+        plume_webgpu.cpp
+        plume_webgpu.h
+    )
+endif()
+
 # Create target
 add_library(plume STATIC ${PLUME_SOURCES})
+
+if(EMSCRIPTEN)
+    target_compile_definitions(plume PUBLIC PLUME_WEBGPU_ENABLED)
+    target_compile_options(plume PUBLIC --use-port=emdawnwebgpu)
+    target_link_options(plume PUBLIC --use-port=emdawnwebgpu)
+endif()
 
 # Include directories
 target_include_directories(plume PUBLIC
