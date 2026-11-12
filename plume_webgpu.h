@@ -12,9 +12,11 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <webgpu/webgpu.h>
@@ -195,6 +197,17 @@ namespace plume {
         bool depthReadOnly = false;
         std::vector<WGPUTextureView> ownedViews;
 
+        // WebGPU needs every attachment the same size, Vulkan doesn't: a color target smaller than the depth buffer renders through a
+        // stand-in of the depth's size, copied in before each pass and back after it.
+        struct ColorStandIn {
+            WGPUTexture real = nullptr;
+            WGPUTexture standIn = nullptr;
+            uint32_t width = 0;
+            uint32_t height = 0;
+        };
+
+        std::vector<ColorStandIn> standIns;
+
         WebGPUFramebuffer(WebGPUDevice *device, const RenderFramebufferDesc &desc);
         ~WebGPUFramebuffer() override;
         uint32_t getWidth() const override;
@@ -325,6 +338,15 @@ namespace plume {
         std::string error;
     };
 
+    // A shader converted and reflected on the thread that asked for its pipeline, ready for the main thread to create.
+    struct WebGPUPreparedShader {
+        bool ok = false;
+        std::string key;
+        std::string wgsl;
+        std::string error;
+        std::vector<WebGPUBinding> bindings;
+    };
+
     struct WebGPUDevice : RenderDevice {
         WebGPUInterface *renderInterface = nullptr;
         WGPUAdapter adapter = nullptr;
@@ -334,14 +356,27 @@ namespace plume {
         RenderDeviceCapabilities capabilities;
         RenderDeviceDescription description;
         bool dualSourceBlending = false;
+        bool depthClipControl = false;
+
+        std::mutex convertMutex;
+        std::unordered_map<std::string, std::shared_ptr<const WebGPUPreparedShader>> prepared;
         std::atomic<bool> lost = false;
 
         std::mutex errorMutex;
         std::string errors;
 
-        // Buffers written on the CPU since the last submission, uploaded before it.
+        // Ranges written on the CPU since the last submission, copied at unmap and uploaded in order before it: the writer may already be
+        // filling the buffer for a later frame when the submission runs.
+        struct PendingWrite {
+            WebGPUBuffer *buffer = nullptr;
+            WGPUBuffer handle = nullptr;
+            uint64_t offset = 0;
+            std::vector<uint8_t> bytes;
+        };
+
         std::mutex dirtyMutex;
-        std::vector<WebGPUBuffer *> dirtyBuffers;
+        std::vector<PendingWrite> pendingWrites;
+        std::atomic<uint32_t> submitsInFlight = 0;
 
         // Main thread only.
         std::unordered_map<std::string, WebGPUModule> modules;
@@ -391,9 +426,12 @@ namespace plume {
         // Validation errors WebGPU reported outside an error scope since the last call.
         std::string takeErrors();
         void reportError(const std::string &message);
-        void markDirty(WebGPUBuffer *buffer);
+        void markDirty(WebGPUBuffer *buffer, uint64_t begin, uint64_t end);
         void forgetBuffer(WebGPUBuffer *buffer);
-        const WebGPUModule &getModule(const WebGPUShader *shader, const RenderSpecConstant *specConstants, uint32_t specConstantsCount, WGPUShaderStage stage);
+        std::shared_ptr<const WebGPUPreparedShader> prepare(const WebGPUShader *shader, const RenderSpecConstant *specConstants, uint32_t specConstantsCount, WGPUShaderStage stage);
+        std::shared_ptr<const WebGPUPreparedShader> prepareInterpolation(const std::shared_ptr<const WebGPUPreparedShader> &vertex, const std::shared_ptr<const WebGPUPreparedShader> &pixel);
+        const WebGPUModule &getModule(const WebGPUPreparedShader &shaderPrepared);
+        std::string moduleKey(const WebGPUShader *shader, const RenderSpecConstant *specConstants, uint32_t specConstantsCount, WGPUShaderStage stage) const;
     };
 
     struct WebGPUInterface : RenderInterface {
@@ -409,4 +447,8 @@ namespace plume {
     };
 
     std::unique_ptr<RenderInterface> CreateWebGPUInterface(WebGPUShaderConverter converter);
+
+    // The converter CreateWebGPUInterface() uses, set by the host before its renderer starts.
+    void webgpuSetShaderConverter(WebGPUShaderConverter converter);
+    std::unique_ptr<RenderInterface> CreateWebGPUInterface();
 };

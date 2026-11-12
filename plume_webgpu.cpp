@@ -13,11 +13,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <regex>
 
+#include <emscripten/em_asm.h>
 #include <emscripten/html5.h>
 #include <emscripten/proxying.h>
 #include <emscripten/threading.h>
+#include <emscripten/emscripten.h>
 
 namespace plume {
     // Threading.
@@ -507,16 +510,84 @@ namespace plume {
         }
     }
 
-    static bool wgslIsSampled(const std::string &wgsl, const std::string &name) {
-        const std::regex sampled("texture(Sample[A-Za-z]*|Gather[A-Za-z]*)\\((\\s*[0-9]+[ui]?\\s*,)?\\s*" + name + "\\s*,");
-        return std::regex_search(wgsl, sampled);
+    static bool isIdentifierChar(char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || (c == '_');
+    }
+
+    static size_t skipSpaces(const std::string &text, size_t i) {
+        while ((i < text.size()) && std::isspace(static_cast<unsigned char>(text[i]))) {
+            i++;
+        }
+
+        return i;
+    }
+
+    static std::string identifierAt(const std::string &text, size_t &i) {
+        const size_t start = i;
+        while ((i < text.size()) && isIdentifierChar(text[i])) {
+            i++;
+        }
+
+        return text.substr(start, i - start);
+    }
+
+    // The textures the WGSL passes to textureSample* / textureGather*, in one pass (regexes over the whole text stalled pipeline creation).
+    static std::unordered_set<std::string> wgslSampledTextures(const std::string &wgsl) {
+        std::unordered_set<std::string> names;
+        for (const char *function : { "textureSample", "textureGather" }) {
+            size_t at = 0;
+            while ((at = wgsl.find(function, at)) != std::string::npos) {
+                size_t i = at + strlen(function);
+                identifierAt(wgsl, i);
+                at = i;
+                i = skipSpaces(wgsl, i);
+                if ((i >= wgsl.size()) || (wgsl[i] != '(')) {
+                    continue;
+                }
+
+                i = skipSpaces(wgsl, i + 1);
+                std::string first = identifierAt(wgsl, i);
+
+                // textureGather's optional component comes first.
+                if (!first.empty() && std::isdigit(static_cast<unsigned char>(first[0]))) {
+                    i = skipSpaces(wgsl, i);
+                    if ((i < wgsl.size()) && (wgsl[i] == ',')) {
+                        i = skipSpaces(wgsl, i + 1);
+                        first = identifierAt(wgsl, i);
+                    }
+                }
+
+                if (!first.empty()) {
+                    names.insert(first);
+                }
+            }
+        }
+
+        return names;
     }
 
     static std::vector<WebGPUBinding> reflectBindings(const std::string &wgsl, WGPUShaderStage stage) {
         static const std::regex declaration("@group\\(([0-9]+)u?\\)\\s*@binding\\(([0-9]+)u?\\)\\s*var(<([^>]*)>)?\\s+([A-Za-z_0-9]+)\\s*:\\s*([^;]+);");
+        const std::unordered_set<std::string> sampled = wgslSampledTextures(wgsl);
         std::vector<WebGPUBinding> bindings;
-        for (std::sregex_iterator it(wgsl.begin(), wgsl.end(), declaration), end; it != end; ++it) {
-            const std::smatch &match = *it;
+
+        // The regex runs on each short declaration, not the whole text.
+        std::vector<std::string> declarations;
+        for (size_t at = wgsl.find("@group("); at != std::string::npos; at = wgsl.find("@group(", at + 1)) {
+            const size_t end = wgsl.find(';', at);
+            if (end == std::string::npos) {
+                break;
+            }
+
+            declarations.push_back(wgsl.substr(at, end - at + 1));
+        }
+
+        for (const std::string &text : declarations) {
+            std::smatch match;
+            if (!std::regex_match(text, match, declaration)) {
+                continue;
+            }
+
             const std::string qualifier = match[4].str();
             const std::string name = match[5].str();
             const std::string type = match[6].str();
@@ -569,7 +640,7 @@ namespace plume {
                 else if (type.find("<i32>") != std::string::npos) {
                     binding.entry.texture.sampleType = WGPUTextureSampleType_Sint;
                 }
-                else if (!binding.entry.texture.multisampled && wgslIsSampled(wgsl, name)) {
+                else if (!binding.entry.texture.multisampled && (sampled.count(name) > 0)) {
                     binding.entry.texture.sampleType = WGPUTextureSampleType_Float;
                 }
                 else {
@@ -586,6 +657,87 @@ namespace plume {
         return bindings;
     }
 
+    // The text between the parentheses of the entry point that follows attribute (e.g. "@fragment"), and what its return type names.
+    static bool wgslEntryPoint(const std::string &wgsl, const char *attribute, std::string &params, std::string &returnType) {
+        const size_t at = wgsl.find(attribute);
+        const size_t open = (at == std::string::npos) ? std::string::npos : wgsl.find('(', at);
+        if (open == std::string::npos) {
+            return false;
+        }
+
+        int depth = 0;
+        size_t close = open;
+        for (; close < wgsl.size(); close++) {
+            depth += (wgsl[close] == '(') ? 1 : ((wgsl[close] == ')') ? -1 : 0);
+            if (depth == 0) {
+                break;
+            }
+        }
+
+        params = wgsl.substr(open + 1, close - open - 1);
+        const size_t brace = wgsl.find('{', close);
+        const size_t arrow = wgsl.find("->", close);
+        returnType = ((arrow != std::string::npos) && (arrow < brace)) ? wgsl.substr(arrow + 2, brace - arrow - 2) : std::string();
+        return true;
+    }
+
+    // WGSL needs a vertex output's interpolation to equal the fragment input's at the same location; SPIR-V for Vulkan doesn't, and RT64's flat
+    // variants mark only the pixel shader. Rewrites the vertex shader's output struct to the fragment shader's interpolation; false if nothing changed.
+    static bool matchInterpolation(const std::string &vertexWgsl, const std::string &fragmentWgsl, std::string &patched) {
+        static const std::regex location("@location\\(([0-9]+)u?\\)(\\s*@interpolate\\([^)]*\\))?");
+        std::string fragmentParams;
+        std::string fragmentReturn;
+        std::string vertexParams;
+        std::string vertexReturn;
+        if (!wgslEntryPoint(fragmentWgsl, "@fragment", fragmentParams, fragmentReturn) || !wgslEntryPoint(vertexWgsl, "@vertex", vertexParams, vertexReturn)) {
+            return false;
+        }
+
+        // Fragment inputs may also sit in a struct the entry point takes.
+        std::string fragmentInputs = fragmentParams;
+        static const std::regex paramType(":\\s*([A-Za-z_][A-Za-z_0-9]*)");
+        for (std::sregex_iterator it(fragmentParams.begin(), fragmentParams.end(), paramType), end; it != end; ++it) {
+            const size_t structAt = fragmentWgsl.find("struct " + (*it)[1].str() + " {");
+            if (structAt != std::string::npos) {
+                fragmentInputs += fragmentWgsl.substr(structAt, fragmentWgsl.find('}', structAt) - structAt);
+            }
+        }
+
+        std::map<std::string, std::string> fragmentInterpolation;
+        for (std::sregex_iterator it(fragmentInputs.begin(), fragmentInputs.end(), location), end; it != end; ++it) {
+            fragmentInterpolation[(*it)[1].str()] = (*it)[2].matched ? (" " + std::regex_replace((*it)[2].str(), std::regex("^\\s+"), "")) : std::string();
+        }
+
+        const std::string structName = std::regex_replace(vertexReturn, std::regex("\\s"), "");
+        const size_t structAt = vertexWgsl.find("struct " + structName + " {");
+        if (structName.empty() || (structAt == std::string::npos)) {
+            return false;
+        }
+
+        const size_t structEnd = vertexWgsl.find('}', structAt);
+        const std::string body = vertexWgsl.substr(structAt, structEnd - structAt);
+        std::string newBody;
+        size_t last = 0;
+        bool changed = false;
+        for (std::sregex_iterator it(body.begin(), body.end(), location), end; it != end; ++it) {
+            const std::smatch &match = *it;
+            auto wanted = fragmentInterpolation.find(match[1].str());
+            const std::string current = match[2].matched ? (" " + std::regex_replace(match[2].str(), std::regex("^\\s+"), "")) : std::string();
+            const std::string interpolation = (wanted != fragmentInterpolation.end()) ? wanted->second : current;
+            newBody += body.substr(last, match.position(0) - last) + "@location(" + match[1].str() + "u)" + interpolation;
+            last = match.position(0) + match.length(0);
+            changed = changed || (interpolation != current);
+        }
+
+        if (!changed) {
+            return false;
+        }
+
+        newBody += body.substr(last);
+        patched = vertexWgsl.substr(0, structAt) + newBody + vertexWgsl.substr(structEnd);
+        return true;
+    }
+
     static uint64_t fnv1a(const void *data, size_t size, uint64_t hash = 14695981039346656037ULL) {
         const uint8_t *bytes = static_cast<const uint8_t *>(data);
         for (size_t i = 0; i < size; i++) {
@@ -599,13 +751,31 @@ namespace plume {
         webgpuRunOnMain(release);
     }
 
+    static void runOwnedJob(void *arg) {
+        std::function<void()> *job = static_cast<std::function<void()> *>(arg);
+        (*job)();
+        delete job;
+    }
+
+    // Releases on the main thread without waiting for it. Release, not destroy: WebGPU keeps an object alive until submitted work using it ends,
+    // which lets fences signal at submission. The job must capture handles by value, never the object being destroyed.
+    static void releaseLater(std::function<void()> release) {
+        if (emscripten_is_main_runtime_thread()) {
+            release();
+            return;
+        }
+
+        emscripten_proxy_async(emscripten_proxy_get_system_queue(), emscripten_main_runtime_thread_id(), runOwnedJob, new std::function<void()>(std::move(release)));
+    }
+
     // WebGPUBuffer
 
     WebGPUBuffer::WebGPUBuffer(WebGPUDevice *device, const RenderBufferDesc &desc) {
         this->device = device;
         this->desc = desc;
         readback = (desc.heapType == RenderHeapType::READBACK);
-        allocatedSize = std::max<uint64_t>((desc.size + 3) & ~uint64_t(3), 4);
+        // 16-byte multiples: WGSL pads uniform structs to 16, so a C++ struct bound whole can be smaller than the shader's.
+        allocatedSize = std::max<uint64_t>((desc.size + 15) & ~uint64_t(15), 16);
         shadow.resize(allocatedSize);
 
         WGPUBufferDescriptor bufferDesc = WGPU_BUFFER_DESCRIPTOR_INIT;
@@ -624,12 +794,11 @@ namespace plume {
 
     WebGPUBuffer::~WebGPUBuffer() {
         device->forgetBuffer(this);
-        releaseOnMain([&]() {
-            if (buffer != nullptr) {
-                wgpuBufferDestroy(buffer);
+        if (buffer != nullptr) {
+            releaseLater([buffer = buffer]() {
                 wgpuBufferRelease(buffer);
-            }
-        });
+            });
+        }
     }
 
     void *WebGPUBuffer::map(uint32_t subresource, const RenderRange *readRange) {
@@ -669,10 +838,12 @@ namespace plume {
     }
 
     void WebGPUBuffer::unmap(uint32_t subresource, const RenderRange *writtenRange) {
-        // shortcut: uploads the whole buffer at the next submission, ignoring writtenRange; upload ranges if big buffers make it slow.
-        if (!readback) {
-            device->markDirty(this);
+        if (readback) {
+            return;
         }
+
+        const bool ranged = (writtenRange != nullptr) && (writtenRange->end > writtenRange->begin);
+        device->markDirty(this, ranged ? writtenRange->begin : 0, ranged ? writtenRange->end : desc.size);
     }
 
     std::unique_ptr<RenderBufferFormattedView> WebGPUBuffer::createBufferFormattedView(RenderFormat format) {
@@ -741,13 +912,12 @@ namespace plume {
             return;
         }
 
-        releaseOnMain([&]() {
-            if (defaultView != nullptr) {
-                wgpuTextureViewRelease(defaultView);
+        releaseLater([view = defaultView, texture = (owned ? texture : nullptr)]() {
+            if (view != nullptr) {
+                wgpuTextureViewRelease(view);
             }
 
-            if (owned && (texture != nullptr)) {
-                wgpuTextureDestroy(texture);
+            if (texture != nullptr) {
                 wgpuTextureRelease(texture);
             }
         });
@@ -795,11 +965,11 @@ namespace plume {
     }
 
     WebGPUTextureView::~WebGPUTextureView() {
-        releaseOnMain([&]() {
-            if (view != nullptr) {
+        if (view != nullptr) {
+            releaseLater([view = view]() {
                 wgpuTextureViewRelease(view);
-            }
-        });
+            });
+        }
     }
 
     // WebGPUShader
@@ -838,11 +1008,11 @@ namespace plume {
     }
 
     WebGPUSampler::~WebGPUSampler() {
-        releaseOnMain([&]() {
-            if (sampler != nullptr) {
+        if (sampler != nullptr) {
+            releaseLater([sampler = sampler]() {
                 wgpuSamplerRelease(sampler);
-            }
-        });
+            });
+        }
     }
 
     // WebGPUDescriptorSet
@@ -878,11 +1048,18 @@ namespace plume {
     }
 
     WebGPUDescriptorSet::~WebGPUDescriptorSet() {
-        releaseOnMain([&]() {
-            for (auto &entry : groups) {
-                wgpuBindGroupRelease(entry.second.group);
-            }
-        });
+        std::vector<WGPUBindGroup> released;
+        for (auto &entry : groups) {
+            released.push_back(entry.second.group);
+        }
+
+        if (!released.empty()) {
+            releaseLater([released = std::move(released)]() {
+                for (WGPUBindGroup group : released) {
+                    wgpuBindGroupRelease(group);
+                }
+            });
+        }
     }
 
     const WebGPUDescriptorSet::Range *WebGPUDescriptorSet::rangeOf(uint32_t descriptorIndex) const {
@@ -976,7 +1153,7 @@ namespace plume {
     }
 
     WebGPUPipeline::~WebGPUPipeline() {
-        releaseOnMain([&]() {
+        releaseLater([compute = compute, render = render, layout = layout, groupLayouts = groupLayouts]() {
             if (compute != nullptr) {
                 wgpuComputePipelineRelease(compute);
             }
@@ -1085,35 +1262,82 @@ namespace plume {
     WebGPUFramebuffer::WebGPUFramebuffer(WebGPUDevice *device, const RenderFramebufferDesc &desc) {
         depthReadOnly = desc.depthAttachmentReadOnly;
         webgpuRunOnMain([&]() {
+            const WebGPUTexture *depthTexture = static_cast<const WebGPUTexture *>(desc.depthAttachment);
+            if (depthTexture != nullptr) {
+                depthView = createAttachmentView(depthTexture);
+                ownedViews.push_back(depthView);
+                depthFormat = depthTexture->format;
+                width = depthTexture->desc.width;
+                height = depthTexture->desc.height;
+                sampleCount = std::max<uint32_t>(depthTexture->desc.multisampling.sampleCount, 1);
+            }
+
             for (uint32_t i = 0; i < desc.colorAttachmentsCount; i++) {
                 const WebGPUTexture *texture = static_cast<const WebGPUTexture *>(desc.colorAttachments[i]);
-                WGPUTextureView view = createAttachmentView(texture);
+                const uint32_t textureSamples = std::max<uint32_t>(texture->desc.multisampling.sampleCount, 1);
+                const bool mismatched = (depthTexture != nullptr) && ((texture->desc.width != depthTexture->desc.width) || (texture->desc.height != depthTexture->desc.height));
+                WGPUTextureView view = nullptr;
+                if (mismatched && (textureSamples == 1)) {
+                    WGPUTextureDescriptor standInDesc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+                    standInDesc.format = texture->format;
+                    standInDesc.size = { depthTexture->desc.width, depthTexture->desc.height, 1 };
+                    standInDesc.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
+
+                    ColorStandIn standIn;
+                    standIn.real = texture->texture;
+                    standIn.standIn = wgpuDeviceCreateTexture(device->device, &standInDesc);
+                    standIn.width = std::min(texture->desc.width, depthTexture->desc.width);
+                    standIn.height = std::min(texture->desc.height, depthTexture->desc.height);
+                    standIns.push_back(standIn);
+
+                    WGPUTextureViewDescriptor viewDesc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+                    view = wgpuTextureCreateView(standIn.standIn, &viewDesc);
+                }
+                else {
+                    if (mismatched) {
+                        device->reportError("a multisampled color target smaller than its depth buffer can't be rendered");
+                    }
+
+                    view = createAttachmentView(texture);
+                }
+
                 ownedViews.push_back(view);
                 colorViews.push_back(view);
                 colorFormats.push_back(texture->format);
-                width = texture->desc.width;
-                height = texture->desc.height;
-                sampleCount = std::max<uint32_t>(texture->desc.multisampling.sampleCount, 1);
+                sampleCount = textureSamples;
             }
 
-            if (desc.depthAttachment != nullptr) {
-                const WebGPUTexture *texture = static_cast<const WebGPUTexture *>(desc.depthAttachment);
-                depthView = createAttachmentView(texture);
-                ownedViews.push_back(depthView);
-                depthFormat = texture->format;
-                width = texture->desc.width;
-                height = texture->desc.height;
-                sampleCount = std::max<uint32_t>(texture->desc.multisampling.sampleCount, 1);
+            // Draws, viewports and scissors follow the color target, as Vulkan's render area would.
+            if (desc.colorAttachmentsCount > 0) {
+                const WebGPUTexture *first = static_cast<const WebGPUTexture *>(desc.colorAttachments[0]);
+                width = first->desc.width;
+                height = first->desc.height;
             }
         });
     }
 
     WebGPUFramebuffer::~WebGPUFramebuffer() {
-        releaseOnMain([&]() {
-            for (WGPUTextureView view : ownedViews) {
+        releaseLater([views = ownedViews, standIns = standIns]() {
+            for (WGPUTextureView view : views) {
                 wgpuTextureViewRelease(view);
             }
+
+            for (const ColorStandIn &standIn : standIns) {
+                wgpuTextureRelease(standIn.standIn);
+            }
         });
+    }
+
+    static void copyStandIns(WGPUCommandEncoder encoder, const WebGPUFramebuffer *framebuffer, bool toStandIn) {
+        for (const WebGPUFramebuffer::ColorStandIn &standIn : framebuffer->standIns) {
+            WGPUTexelCopyTextureInfo real = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            WGPUTexelCopyTextureInfo stand = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            real.texture = standIn.real;
+            stand.texture = standIn.standIn;
+
+            const WGPUExtent3D size = { standIn.width, standIn.height, 1 };
+            wgpuCommandEncoderCopyTextureToTexture(encoder, toStandIn ? &real : &stand, toStandIn ? &stand : &real, &size);
+        }
     }
 
     uint32_t WebGPUFramebuffer::getWidth() const {
@@ -1195,6 +1419,7 @@ namespace plume {
                 wgpuRenderPassEncoderEnd(renderPass);
                 wgpuRenderPassEncoderRelease(renderPass);
                 renderPass = nullptr;
+                copyStandIns(encoder, framebuffer, false);
             }
         }
 
@@ -1238,6 +1463,7 @@ namespace plume {
 
             depthClearPending = false;
             stencilClearPending = false;
+            copyStandIns(encoder, framebuffer, true);
             renderPass = wgpuCommandEncoderBeginRenderPass(encoder, &passDesc);
             graphicsPipelineDirty = true;
             graphics.groupsDirty = true;
@@ -1297,6 +1523,11 @@ namespace plume {
                         entry.buffer = descriptor->buffer->buffer;
                         entry.offset = descriptor->offset;
                         entry.size = (descriptor->size > 0) ? descriptor->size : WGPU_WHOLE_SIZE;
+
+                        // Uniform bindings round up to the shader's 16-byte padded size where the buffer has room.
+                        if ((entry.size != WGPU_WHOLE_SIZE) && (layoutEntry.buffer.type == WGPUBufferBindingType_Uniform)) {
+                            entry.size = std::min((entry.size + 15) & ~uint64_t(15), descriptor->buffer->allocatedSize - entry.offset);
+                        }
                     }
                 }
                 else if (layoutEntry.sampler.type != WGPUSamplerBindingType_BindingNotUsed) {
@@ -1868,7 +2099,28 @@ namespace plume {
     void WebGPUCommandList::copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) {
         commands.emplace_back([=](WebGPUContext &ctx) {
             ctx.endPasses();
-            wgpuCommandEncoderCopyBufferToBuffer(ctx.encoder, static_cast<const WebGPUBuffer *>(srcBuffer.ref)->buffer, srcBuffer.offset, static_cast<const WebGPUBuffer *>(dstBuffer.ref)->buffer, dstBuffer.offset, size);
+
+            // WebGPU copies 4-byte-aligned ranges. RT64 copies byte ranges between buffers laid out alike (upload to default at the same offset),
+            // so the range widens to whole words, which copies bytes the destination already mirrors.
+            const WebGPUBuffer *src = static_cast<const WebGPUBuffer *>(srcBuffer.ref);
+            const WebGPUBuffer *dst = static_cast<const WebGPUBuffer *>(dstBuffer.ref);
+            uint64_t srcOffset = srcBuffer.offset;
+            uint64_t dstOffset = dstBuffer.offset;
+            uint64_t copySize = size;
+            if (((srcOffset | dstOffset | copySize) & 3) != 0) {
+                if ((srcOffset & 3) != (dstOffset & 3)) {
+                    ctx.device->reportError("a buffer copy between differently aligned offsets is skipped");
+                    return;
+                }
+
+                const uint64_t lead = srcOffset & 3;
+                srcOffset -= lead;
+                dstOffset -= lead;
+                copySize = (copySize + lead + 3) & ~uint64_t(3);
+                copySize = std::min({ copySize, src->allocatedSize - srcOffset, dst->allocatedSize - dstOffset });
+            }
+
+            wgpuCommandEncoderCopyBufferToBuffer(ctx.encoder, src->buffer, srcOffset, dst->buffer, dstOffset, copySize);
         });
     }
 
@@ -2078,6 +2330,46 @@ namespace plume {
             return false;
         }
 
+        // Like a vsync'd present, wait for the browser's next animation frame: it paces the render threads, which would otherwise flood the
+        // main thread with work and keep the page from ever drawing.
+        // Hidden tabs get no animation frames, so a timer ends the wait there.
+        if (vsyncEnabled && !emscripten_is_main_runtime_thread()) {
+            webgpuRunOnMainAsync([](std::function<void()> done) {
+                struct Wait {
+                    std::function<void()> done;
+                    int pending = 2;
+                    bool finished = false;
+                };
+
+                Wait *wait = new Wait{ std::move(done) };
+                emscripten_request_animation_frame([](double, void *userData) -> EM_BOOL {
+                    Wait *w = static_cast<Wait *>(userData);
+                    if (!w->finished) {
+                        w->finished = true;
+                        w->done();
+                    }
+
+                    if (--w->pending == 0) {
+                        delete w;
+                    }
+
+                    return EM_FALSE;
+                }, wait);
+
+                emscripten_set_timeout([](void *userData) {
+                    Wait *w = static_cast<Wait *>(userData);
+                    if (!w->finished) {
+                        w->finished = true;
+                        w->done();
+                    }
+
+                    if (--w->pending == 0) {
+                        delete w;
+                    }
+                }, 100, wait);
+            });
+        }
+
         bool presented = false;
         const WebGPUTexture *source = static_cast<const WebGPUTexture *>(textures[textureIndex].get());
         webgpuRunOnMain([&]() {
@@ -2212,7 +2504,30 @@ namespace plume {
             fence->pending = 1;
         }
 
-        webgpuRunOnMain([&]() {
+        // Fire and forget: the main thread replays in queue order and signals the fence after, so only fence waits block. The CPU writes made
+        // before this call travel with it, so writes made after it can't reach this submission.
+        std::vector<const RenderCommandList *> lists(commandLists, commandLists + commandListCount);
+        std::vector<WebGPUDevice::PendingWrite> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(device->dirtyMutex);
+            snapshot.swap(device->pendingWrites);
+        }
+
+        // At most two submissions wait for the main thread, as a driver throttles a CPU that runs ahead; an unbounded queue keeps the main
+        // thread from ever yielding, so the page stops drawing.
+        WebGPUDevice *device = this->device;
+        if (!emscripten_is_main_runtime_thread()) {
+            uint32_t inFlight = device->submitsInFlight.load();
+            while (inFlight >= 2) {
+                emscripten_futex_wait(&device->submitsInFlight, inFlight, INFINITY);
+                inFlight = device->submitsInFlight.load();
+            }
+        }
+
+        device->submitsInFlight++;
+        releaseLater([device, fence, pushSlots, lists = std::move(lists), writes = std::move(snapshot)]() {
+            const uint32_t commandListCount = uint32_t(lists.size());
+            const RenderCommandList *const *commandLists = lists.data();
             const uint64_t ringNeeded = std::max<uint64_t>(pushSlots, 1) * WebGPUPushConstantStride;
             if (ringNeeded > device->pushRingSize) {
                 if (device->pushRing != nullptr) {
@@ -2228,14 +2543,8 @@ namespace plume {
                 device->pushRingGeneration++;
             }
 
-            std::vector<WebGPUBuffer *> dirty;
-            {
-                std::lock_guard<std::mutex> lock(device->dirtyMutex);
-                dirty.swap(device->dirtyBuffers);
-            }
-
-            for (WebGPUBuffer *buffer : dirty) {
-                wgpuQueueWriteBuffer(device->queue, buffer->buffer, 0, buffer->shadow.data(), buffer->allocatedSize);
+            for (const WebGPUDevice::PendingWrite &write : writes) {
+                wgpuQueueWriteBuffer(device->queue, write.handle, write.offset, write.bytes.data(), write.bytes.size());
             }
 
             WebGPUContext ctx;
@@ -2261,18 +2570,16 @@ namespace plume {
             wgpuCommandBufferRelease(commandBuffer);
             wgpuCommandEncoderRelease(ctx.encoder);
 
+            // The fence signals at submission: the commands were replayed above, CPU writes are already snapshots queued ahead of them, objects
+            // are released rather than destroyed, and readbacks wait on their own mapAsync. Chrome resolves onSubmittedWorkDone about once a
+            // display frame, which made every RT64 fence wait cost most of a frame.
             if (fence != nullptr) {
-                WGPUQueueWorkDoneCallbackInfo callbackInfo = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
-                callbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
-                callbackInfo.userdata1 = fence;
-                callbackInfo.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView message, void *userdata1, void *) {
-                    WebGPUCommandFence *fence = static_cast<WebGPUCommandFence *>(userdata1);
-                    fence->pending = 0;
-                    emscripten_futex_wake(&fence->pending, INT_MAX);
-                };
-
-                wgpuQueueOnSubmittedWorkDone(device->queue, callbackInfo);
+                fence->pending = 0;
+                emscripten_futex_wake(&fence->pending, INT_MAX);
             }
+
+            device->submitsInFlight--;
+            emscripten_futex_wake(&device->submitsInFlight, INT_MAX);
         });
     }
 
@@ -2362,7 +2669,7 @@ namespace plume {
                 }
 
                 std::vector<WGPUFeatureName> features;
-                const WGPUFeatureName optionalFeatures[] = { WGPUFeatureName_DualSourceBlending, WGPUFeatureName_Float32Filterable };
+                const WGPUFeatureName optionalFeatures[] = { WGPUFeatureName_DualSourceBlending, WGPUFeatureName_Float32Filterable, WGPUFeatureName_DepthClipControl };
                 for (WGPUFeatureName feature : optionalFeatures) {
                     if (wgpuAdapterHasFeature(adapter, feature)) {
                         features.push_back(feature);
@@ -2370,6 +2677,7 @@ namespace plume {
                 }
 
                 self->dualSourceBlending = wgpuAdapterHasFeature(adapter, WGPUFeatureName_DualSourceBlending);
+                self->depthClipControl = wgpuAdapterHasFeature(adapter, WGPUFeatureName_DepthClipControl);
 
                 WGPUDeviceDescriptor deviceDesc = WGPU_DEVICE_DESCRIPTOR_INIT;
                 deviceDesc.requiredFeatureCount = features.size();
@@ -2419,6 +2727,7 @@ namespace plume {
         capabilities.rayQuery = false;
         capabilities.descriptorIndexing = false;
         capabilities.maxTexturesPerStage = limits.maxSampledTexturesPerShaderStage;
+        capabilities.maxStorageBuffersPerStage = limits.maxStorageBuffersPerShaderStage;
         capabilities.maxTextureSize = limits.maxTextureDimension2D;
         capabilities.triangleFan = false;
         capabilities.dynamicDepthBias = false;
@@ -2476,44 +2785,107 @@ namespace plume {
         errors += message;
     }
 
-    void WebGPUDevice::markDirty(WebGPUBuffer *buffer) {
-        std::lock_guard<std::mutex> lock(dirtyMutex);
-        if (std::find(dirtyBuffers.begin(), dirtyBuffers.end(), buffer) == dirtyBuffers.end()) {
-            dirtyBuffers.push_back(buffer);
+    void WebGPUDevice::markDirty(WebGPUBuffer *buffer, uint64_t begin, uint64_t end) {
+        // writeBuffer takes 4-byte-aligned ranges; the shadow holds the bytes around the written ones too.
+        begin &= ~uint64_t(3);
+        end = std::min((end + 3) & ~uint64_t(3), buffer->allocatedSize);
+        if (end <= begin) {
+            return;
         }
+
+        PendingWrite write;
+        write.buffer = buffer;
+        write.handle = buffer->buffer;
+        write.offset = begin;
+        write.bytes.assign(buffer->shadow.begin() + begin, buffer->shadow.begin() + end);
+
+        std::lock_guard<std::mutex> lock(dirtyMutex);
+        pendingWrites.push_back(std::move(write));
     }
 
     void WebGPUDevice::forgetBuffer(WebGPUBuffer *buffer) {
         std::lock_guard<std::mutex> lock(dirtyMutex);
-        dirtyBuffers.erase(std::remove(dirtyBuffers.begin(), dirtyBuffers.end(), buffer), dirtyBuffers.end());
+        pendingWrites.erase(std::remove_if(pendingWrites.begin(), pendingWrites.end(), [buffer](const PendingWrite &write) {
+            return write.buffer == buffer;
+        }), pendingWrites.end());
     }
 
-    const WebGPUModule &WebGPUDevice::getModule(const WebGPUShader *shader, const RenderSpecConstant *specConstants, uint32_t specConstantsCount, WGPUShaderStage stage) {
+    std::string WebGPUDevice::moduleKey(const WebGPUShader *shader, const RenderSpecConstant *specConstants, uint32_t specConstantsCount, WGPUShaderStage stage) const {
         uint64_t hash = fnv1a(shader->spirv.data(), shader->spirv.size() * sizeof(uint32_t));
         hash = fnv1a(specConstants, specConstantsCount * sizeof(RenderSpecConstant), hash);
-        const std::string key = std::to_string(hash) + ":" + shader->entryPointName + ":" + std::to_string(stage);
-        auto it = modules.find(key);
+        return std::to_string(hash) + ":" + shader->entryPointName + ":" + std::to_string(stage);
+    }
+
+    std::shared_ptr<const WebGPUPreparedShader> WebGPUDevice::prepare(const WebGPUShader *shader, const RenderSpecConstant *specConstants, uint32_t specConstantsCount, WGPUShaderStage stage) {
+        const std::string key = moduleKey(shader, specConstants, specConstantsCount, stage);
+        {
+            std::lock_guard<std::mutex> lock(convertMutex);
+            auto it = prepared.find(key);
+            if (it != prepared.end()) {
+                return it->second;
+            }
+        }
+
+        auto shaderPrepared = std::make_shared<WebGPUPreparedShader>();
+        shaderPrepared->key = key;
+        shaderPrepared->ok = renderInterface->converter && renderInterface->converter(shader->spirv, specConstants, specConstantsCount, shaderPrepared->wgsl, shaderPrepared->error);
+        if (shaderPrepared->ok) {
+            shaderPrepared->bindings = reflectBindings(shaderPrepared->wgsl, stage);
+        }
+        else if (shaderPrepared->error.empty()) {
+            shaderPrepared->error = "no shader converter";
+        }
+
+        std::lock_guard<std::mutex> lock(convertMutex);
+        return prepared.emplace(key, shaderPrepared).first->second;
+    }
+
+    std::shared_ptr<const WebGPUPreparedShader> WebGPUDevice::prepareInterpolation(const std::shared_ptr<const WebGPUPreparedShader> &vertex, const std::shared_ptr<const WebGPUPreparedShader> &pixel) {
+        if (!vertex->ok || !pixel->ok) {
+            return vertex;
+        }
+
+        const std::string key = "interp:" + vertex->key + "|" + pixel->key;
+        {
+            std::lock_guard<std::mutex> lock(convertMutex);
+            auto it = prepared.find(key);
+            if (it != prepared.end()) {
+                return it->second;
+            }
+        }
+
+        std::shared_ptr<const WebGPUPreparedShader> result = vertex;
+        std::string patched;
+        if (matchInterpolation(vertex->wgsl, pixel->wgsl, patched)) {
+            auto patchedShader = std::make_shared<WebGPUPreparedShader>(*vertex);
+            patchedShader->key = key;
+            patchedShader->wgsl = std::move(patched);
+            result = patchedShader;
+        }
+
+        std::lock_guard<std::mutex> lock(convertMutex);
+        return prepared.emplace(key, result).first->second;
+    }
+
+    const WebGPUModule &WebGPUDevice::getModule(const WebGPUPreparedShader &shaderPrepared) {
+        auto it = modules.find(shaderPrepared.key);
         if (it != modules.end()) {
             return it->second;
         }
 
-        WebGPUModule &module = modules[key];
-        std::string wgsl;
-        if (!renderInterface->converter || !renderInterface->converter(shader->spirv, specConstants, specConstantsCount, wgsl, module.error)) {
-            if (module.error.empty()) {
-                module.error = "no shader converter";
-            }
-
+        WebGPUModule &module = modules[shaderPrepared.key];
+        if (!shaderPrepared.ok) {
+            module.error = shaderPrepared.error;
             return module;
         }
 
         WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
-        source.code = toView(wgsl);
+        source.code = toView(shaderPrepared.wgsl);
 
         WGPUShaderModuleDescriptor moduleDesc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
         moduleDesc.nextInChain = &source.chain;
         module.module = wgpuDeviceCreateShaderModule(device, &moduleDesc);
-        module.bindings = reflectBindings(wgsl, stage);
+        module.bindings = shaderPrepared.bindings;
         return module;
     }
 
@@ -2537,9 +2909,10 @@ namespace plume {
     std::unique_ptr<RenderPipeline> WebGPUDevice::createComputePipeline(const RenderComputePipelineDesc &desc) {
         auto pipeline = std::make_unique<WebGPUPipeline>(WebGPUPipeline::Type::Compute);
         pipeline->valid = true;
+        const WebGPUShader *shader = static_cast<const WebGPUShader *>(desc.computeShader);
+        const std::shared_ptr<const WebGPUPreparedShader> computePrepared = prepare(shader, desc.specConstants, desc.specConstantsCount, WGPUShaderStage_Compute);
         createWithErrorScope(this, pipeline.get(), [&]() {
-            const WebGPUShader *shader = static_cast<const WebGPUShader *>(desc.computeShader);
-            const WebGPUModule &module = getModule(shader, desc.specConstants, desc.specConstantsCount, WGPUShaderStage_Compute);
+            const WebGPUModule &module = getModule(*computePrepared);
             if (module.module == nullptr) {
                 pipeline->valid = false;
                 pipeline->error = module.error;
@@ -2569,11 +2942,18 @@ namespace plume {
             return pipeline;
         }
 
+        // Converting, reflecting and patching run here, on the thread that asked; the main thread only creates the objects.
+        const WebGPUShader *vertexShader = static_cast<const WebGPUShader *>(desc.vertexShader);
+        const WebGPUShader *pixelShader = static_cast<const WebGPUShader *>(desc.pixelShader);
+        std::shared_ptr<const WebGPUPreparedShader> vertexPrepared = prepare(vertexShader, desc.specConstants, desc.specConstantsCount, WGPUShaderStage_Vertex);
+        const std::shared_ptr<const WebGPUPreparedShader> pixelPrepared = (pixelShader != nullptr) ? prepare(pixelShader, desc.specConstants, desc.specConstantsCount, WGPUShaderStage_Fragment) : nullptr;
+        if (pixelPrepared != nullptr) {
+            vertexPrepared = prepareInterpolation(vertexPrepared, pixelPrepared);
+        }
+
         createWithErrorScope(this, pipeline.get(), [&]() {
-            const WebGPUShader *vertexShader = static_cast<const WebGPUShader *>(desc.vertexShader);
-            const WebGPUShader *pixelShader = static_cast<const WebGPUShader *>(desc.pixelShader);
-            const WebGPUModule &vertexModule = getModule(vertexShader, desc.specConstants, desc.specConstantsCount, WGPUShaderStage_Vertex);
-            const WebGPUModule *pixelModule = (pixelShader != nullptr) ? &getModule(pixelShader, desc.specConstants, desc.specConstantsCount, WGPUShaderStage_Fragment) : nullptr;
+            const WebGPUModule *pixelModule = (pixelPrepared != nullptr) ? &getModule(*pixelPrepared) : nullptr;
+            const WebGPUModule &vertexModule = getModule(*vertexPrepared);
             if ((vertexModule.module == nullptr) || ((pixelModule != nullptr) && (pixelModule->module == nullptr))) {
                 pipeline->valid = false;
                 pipeline->error = (vertexModule.module == nullptr) ? vertexModule.error : pixelModule->error;
@@ -2630,6 +3010,7 @@ namespace plume {
             pipelineDesc.primitive.topology = toWgpu(desc.primitiveTopology);
             pipelineDesc.primitive.frontFace = (desc.frontFace == RenderFrontFace::COUNTER_CLOCKWISE) ? WGPUFrontFace_CCW : WGPUFrontFace_CW;
             pipelineDesc.primitive.cullMode = (desc.cullMode == RenderCullMode::FRONT) ? WGPUCullMode_Front : ((desc.cullMode == RenderCullMode::BACK) ? WGPUCullMode_Back : WGPUCullMode_None);
+            pipelineDesc.primitive.unclippedDepth = depthClipControl && !desc.depthClipEnabled;
             pipelineDesc.multisample.count = std::max<uint32_t>(desc.multisampling.sampleCount, 1);
             pipelineDesc.multisample.alphaToCoverageEnabled = desc.alphaToCoverageEnabled;
 
@@ -2796,5 +3177,18 @@ namespace plume {
 
     std::unique_ptr<RenderInterface> CreateWebGPUInterface(WebGPUShaderConverter converter) {
         return std::make_unique<WebGPUInterface>(std::move(converter));
+    }
+
+    static WebGPUShaderConverter &defaultConverter() {
+        static WebGPUShaderConverter converter;
+        return converter;
+    }
+
+    void webgpuSetShaderConverter(WebGPUShaderConverter converter) {
+        defaultConverter() = std::move(converter);
+    }
+
+    std::unique_ptr<RenderInterface> CreateWebGPUInterface() {
+        return CreateWebGPUInterface(defaultConverter());
     }
 };

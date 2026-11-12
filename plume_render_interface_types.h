@@ -1788,6 +1788,8 @@ namespace plume {
 
         // Sampled images one shader stage can access (small on GPUs like the Raspberry Pi's, which can't hold a bindless texture array).
         uint32_t maxTexturesPerStage = UINT32_MAX;
+        // Storage buffers one shader stage can access (WebGPU devices may allow as few as 8).
+        uint32_t maxStorageBuffersPerStage = UINT32_MAX;
 
         // Buffers.
         bool bufferDeviceAddress = false;
