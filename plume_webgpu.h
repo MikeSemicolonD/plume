@@ -260,6 +260,37 @@ namespace plume {
     struct WebGPUCommandSemaphore : RenderCommandSemaphore {
     };
 
+    // Renders into its own textures and copies the presented one onto the page's #canvas, whose texture changes every frame.
+    struct WebGPUSwapChain : RenderSwapChain {
+        WebGPUDevice *device = nullptr;
+        RenderSwapChainDesc desc;
+        WGPUSurface surface = nullptr;
+        WGPUTextureFormat format = WGPUTextureFormat_Undefined;
+        std::vector<std::unique_ptr<RenderTexture>> textures;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t nextTexture = 0;
+        bool vsyncEnabled = true;
+
+        WebGPUSwapChain(WebGPUDevice *device, const RenderSwapChainDesc &desc);
+        ~WebGPUSwapChain() override;
+        bool present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) override;
+        void wait() override;
+        bool resize() override;
+        bool needsResize() const override;
+        void setVsyncEnabled(bool vsyncEnabled) override;
+        bool isVsyncEnabled() const override;
+        uint32_t getWidth() const override;
+        uint32_t getHeight() const override;
+        RenderTexture *getTexture(uint32_t textureIndex) override;
+        uint32_t getTextureCount() const override;
+        bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) override;
+        RenderWindow getWindow() const override;
+        bool isEmpty() const override;
+        uint32_t getRefreshRate() const override;
+        void canvasSize(uint32_t &canvasWidth, uint32_t &canvasHeight) const;
+    };
+
     struct WebGPUCommandQueue : RenderCommandQueue {
         WebGPUDevice *device = nullptr;
 
@@ -315,6 +346,16 @@ namespace plume {
         // Main thread only.
         std::unordered_map<std::string, WebGPUModule> modules;
         std::unordered_map<WGPUBindGroupLayout, WebGPUDescriptorSet::CachedGroup> setlessGroups;
+
+        // Partial clears draw a scissored triangle; WebGPU only clears whole attachments.
+        struct {
+            WGPUShaderModule module = nullptr;
+            WGPUBindGroupLayout groupLayout = nullptr;
+            WGPUPipelineLayout layout = nullptr;
+            WebGPUDescriptorSet::CachedGroup group;
+            std::unordered_map<std::string, WGPURenderPipeline> pipelines;
+        } rectClear;
+
         WGPUBuffer pushRing = nullptr;
         uint64_t pushRingSize = 0;
         uint64_t pushRingGeneration = 0;

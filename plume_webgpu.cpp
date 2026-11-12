@@ -15,6 +15,7 @@
 #include <cstring>
 #include <regex>
 
+#include <emscripten/html5.h>
 #include <emscripten/proxying.h>
 #include <emscripten/threading.h>
 
@@ -1428,6 +1429,146 @@ namespace plume {
             return true;
         }
 
+        WGPURenderPipeline rectClearPipeline(int32_t colorIndex) {
+            auto &rectClear = device->rectClear;
+            if (rectClear.module == nullptr) {
+                std::string wgsl =
+                    "struct Clear { color : vec4<f32>, depth : f32 }\n"
+                    "@group(0) @binding(0) var<uniform> clearValue : Clear;\n"
+                    "@vertex fn vs(@builtin(vertex_index) i : u32) -> @builtin(position) vec4<f32> {\n"
+                    "  let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+                    "  return vec4<f32>(uv * 2.0 - 1.0, clearValue.depth, 1.0);\n"
+                    "}\n";
+
+                for (uint32_t i = 0; i < 8; i++) {
+                    wgsl += "@fragment fn fs" + std::to_string(i) + "() -> @location(" + std::to_string(i) + ") vec4<f32> { return clearValue.color; }\n";
+                }
+
+                WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+                source.code = toView(wgsl);
+
+                WGPUShaderModuleDescriptor moduleDesc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+                moduleDesc.nextInChain = &source.chain;
+                rectClear.module = wgpuDeviceCreateShaderModule(device->device, &moduleDesc);
+
+                WGPUBindGroupLayoutEntry entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+                entry.binding = 0;
+                entry.visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+                entry.buffer.type = WGPUBufferBindingType_Uniform;
+                entry.buffer.hasDynamicOffset = true;
+
+                WGPUBindGroupLayoutDescriptor groupDesc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+                groupDesc.entryCount = 1;
+                groupDesc.entries = &entry;
+                rectClear.groupLayout = wgpuDeviceCreateBindGroupLayout(device->device, &groupDesc);
+
+                WGPUPipelineLayoutDescriptor layoutDesc = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+                layoutDesc.bindGroupLayoutCount = 1;
+                layoutDesc.bindGroupLayouts = &rectClear.groupLayout;
+                rectClear.layout = wgpuDeviceCreatePipelineLayout(device->device, &layoutDesc);
+            }
+
+            std::string key = std::to_string(colorIndex) + ":" + std::to_string(framebuffer->depthFormat) + ":" + std::to_string(framebuffer->sampleCount);
+            for (WGPUTextureFormat format : framebuffer->colorFormats) {
+                key += ":" + std::to_string(format);
+            }
+
+            auto it = rectClear.pipelines.find(key);
+            if (it != rectClear.pipelines.end()) {
+                return it->second;
+            }
+
+            const std::string fragmentEntry = "fs" + std::to_string(std::max(colorIndex, 0));
+            std::vector<WGPUColorTargetState> targets(framebuffer->colorFormats.size());
+            for (size_t i = 0; i < targets.size(); i++) {
+                targets[i] = WGPU_COLOR_TARGET_STATE_INIT;
+                targets[i].format = framebuffer->colorFormats[i];
+                targets[i].writeMask = (int32_t(i) == colorIndex) ? WGPUColorWriteMask_All : WGPUColorWriteMask_None;
+            }
+
+            WGPURenderPipelineDescriptor pipelineDesc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+            pipelineDesc.layout = rectClear.layout;
+            pipelineDesc.vertex.module = rectClear.module;
+            pipelineDesc.vertex.entryPoint = toView("vs");
+            pipelineDesc.multisample.count = framebuffer->sampleCount;
+
+            WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+            if (!targets.empty()) {
+                fragment.module = rectClear.module;
+                fragment.entryPoint = toView(fragmentEntry);
+                fragment.targetCount = targets.size();
+                fragment.targets = targets.data();
+                pipelineDesc.fragment = &fragment;
+            }
+
+            WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
+            if (framebuffer->depthView != nullptr) {
+                depthStencil.format = framebuffer->depthFormat;
+                depthStencil.depthWriteEnabled = (colorIndex < 0) ? WGPUOptionalBool_True : WGPUOptionalBool_False;
+                depthStencil.depthCompare = WGPUCompareFunction_Always;
+                depthStencil.stencilReadMask = 0;
+                depthStencil.stencilWriteMask = 0;
+                pipelineDesc.depthStencil = &depthStencil;
+            }
+
+            WGPURenderPipeline pipeline = wgpuDeviceCreateRenderPipeline(device->device, &pipelineDesc);
+            rectClear.pipelines[key] = pipeline;
+            return pipeline;
+        }
+
+        // Clears rects of one color attachment, or of depth when colorIndex is negative, by drawing scissored triangles.
+        void clearRects(int32_t colorIndex, WGPUColor color, float depth, const std::vector<RenderRect> &rects) {
+            if (renderPass == nullptr) {
+                beginRenderPass();
+            }
+
+            WGPURenderPipeline pipeline = rectClearPipeline(colorIndex);
+            auto &rectClear = device->rectClear;
+            if ((rectClear.group.group == nullptr) || (rectClear.group.ringGeneration != device->pushRingGeneration)) {
+                if (rectClear.group.group != nullptr) {
+                    wgpuBindGroupRelease(rectClear.group.group);
+                }
+
+                WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
+                entry.binding = 0;
+                entry.buffer = device->pushRing;
+                entry.size = WebGPUPushConstantStride;
+
+                WGPUBindGroupDescriptor groupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+                groupDesc.layout = rectClear.groupLayout;
+                groupDesc.entryCount = 1;
+                groupDesc.entries = &entry;
+                rectClear.group.group = wgpuDeviceCreateBindGroup(device->device, &groupDesc);
+                rectClear.group.ringGeneration = device->pushRingGeneration;
+            }
+
+            uint8_t block[WebGPUPushConstantStride] = {};
+            const float values[5] = { float(color.r), float(color.g), float(color.b), float(color.a), depth };
+            memcpy(block, values, sizeof(values));
+
+            const uint32_t offset = uint32_t(pushStaging.size());
+            pushStaging.insert(pushStaging.end(), block, block + sizeof(block));
+
+            wgpuRenderPassEncoderSetPipeline(renderPass, pipeline);
+            wgpuRenderPassEncoderSetBindGroup(renderPass, 0, rectClear.group.group, 1, &offset);
+            wgpuRenderPassEncoderSetViewport(renderPass, 0.0f, 0.0f, float(framebuffer->width), float(framebuffer->height), 0.0f, 1.0f);
+            for (const RenderRect &rect : rects) {
+                const int32_t left = std::clamp(rect.left, 0, int32_t(framebuffer->width));
+                const int32_t top = std::clamp(rect.top, 0, int32_t(framebuffer->height));
+                const int32_t right = std::clamp(rect.right, left, int32_t(framebuffer->width));
+                const int32_t bottom = std::clamp(rect.bottom, top, int32_t(framebuffer->height));
+                if ((right > left) && (bottom > top)) {
+                    wgpuRenderPassEncoderSetScissorRect(renderPass, uint32_t(left), uint32_t(top), uint32_t(right - left), uint32_t(bottom - top));
+                    wgpuRenderPassEncoderDraw(renderPass, 3, 1, 0, 0);
+                }
+            }
+
+            graphicsPipelineDirty = true;
+            graphics.groupsDirty = true;
+            viewportDirty = true;
+            scissorDirty = true;
+        }
+
         bool flushCompute() {
             if ((computePipeline == nullptr) || !computePipeline->valid) {
                 return false;
@@ -1674,13 +1815,14 @@ namespace plume {
 
     void WebGPUCommandList::clearColor(uint32_t attachmentIndex, RenderColor colorValue, const RenderRect *clearRects, uint32_t clearRectsCount) {
         std::vector<RenderRect> rects(clearRects, clearRects + clearRectsCount);
+        pushFlushes++;
         commands.emplace_back([=](WebGPUContext &ctx) {
             if ((ctx.framebuffer == nullptr) || (attachmentIndex >= ctx.colorClearPending.size())) {
                 return;
             }
 
             if (!coversFramebuffer(ctx.framebuffer, rects.data(), uint32_t(rects.size()))) {
-                ctx.device->reportError("partial color clears are not implemented yet");
+                ctx.clearRects(int32_t(attachmentIndex), { colorValue.r, colorValue.g, colorValue.b, colorValue.a }, 0.0f, rects);
                 return;
             }
 
@@ -1692,13 +1834,21 @@ namespace plume {
 
     void WebGPUCommandList::clearDepthStencil(bool clearDepth, bool clearStencil, float depthValue, uint32_t stencilValue, const RenderRect *clearRects, uint32_t clearRectsCount) {
         std::vector<RenderRect> rects(clearRects, clearRects + clearRectsCount);
+        pushFlushes++;
         commands.emplace_back([=](WebGPUContext &ctx) {
             if ((ctx.framebuffer == nullptr) || (ctx.framebuffer->depthView == nullptr)) {
                 return;
             }
 
             if (!coversFramebuffer(ctx.framebuffer, rects.data(), uint32_t(rects.size()))) {
-                ctx.device->reportError("partial depth clears are not implemented yet");
+                if (clearStencil) {
+                    ctx.device->reportError("partial stencil clears are not supported");
+                }
+
+                if (clearDepth) {
+                    ctx.clearRects(-1, { 0.0, 0.0, 0.0, 0.0 }, depthValue, rects);
+                }
+
                 return;
             }
 
@@ -1863,8 +2013,192 @@ namespace plume {
     }
 
     std::unique_ptr<RenderSwapChain> WebGPUCommandQueue::createSwapChain(const RenderSwapChainDesc &desc) {
-        device->reportError("swap chains are not implemented yet");
-        return nullptr;
+        auto swapChain = std::make_unique<WebGPUSwapChain>(device, desc);
+        if (swapChain->surface == nullptr) {
+            return nullptr;
+        }
+
+        return swapChain;
+    }
+
+    // WebGPUSwapChain
+
+    // shortcut: always the page's #canvas (where Emscripten's SDL draws); take the canvas from the SDL window if a page ever has two.
+    static const char *CanvasSelector = "#canvas";
+
+    WebGPUSwapChain::WebGPUSwapChain(WebGPUDevice *device, const RenderSwapChainDesc &desc) {
+        this->device = device;
+        this->desc = desc;
+        format = toWgpu(desc.format);
+        if (format == WGPUTextureFormat_Undefined) {
+            format = WGPUTextureFormat_BGRA8Unorm;
+            this->desc.format = RenderFormat::B8G8R8A8_UNORM;
+        }
+
+        webgpuRunOnMain([&]() {
+            WGPUEmscriptenSurfaceSourceCanvasHTMLSelector canvasSource = WGPU_EMSCRIPTEN_SURFACE_SOURCE_CANVAS_HTML_SELECTOR_INIT;
+            canvasSource.selector = toView(CanvasSelector);
+
+            WGPUSurfaceDescriptor surfaceDesc = WGPU_SURFACE_DESCRIPTOR_INIT;
+            surfaceDesc.nextInChain = &canvasSource.chain;
+            surface = wgpuInstanceCreateSurface(device->renderInterface->instance, &surfaceDesc);
+        });
+
+        if (surface == nullptr) {
+            device->reportError("no WebGPU surface for the page's canvas");
+            return;
+        }
+
+        resize();
+    }
+
+    WebGPUSwapChain::~WebGPUSwapChain() {
+        textures.clear();
+        releaseOnMain([&]() {
+            if (surface != nullptr) {
+                wgpuSurfaceUnconfigure(surface);
+                wgpuSurfaceRelease(surface);
+            }
+        });
+    }
+
+    void WebGPUSwapChain::canvasSize(uint32_t &canvasWidth, uint32_t &canvasHeight) const {
+        int w = 0;
+        int h = 0;
+        webgpuRunOnMain([&]() {
+            emscripten_get_canvas_element_size(CanvasSelector, &w, &h);
+        });
+
+        canvasWidth = uint32_t(std::max(w, 0));
+        canvasHeight = uint32_t(std::max(h, 0));
+    }
+
+    bool WebGPUSwapChain::present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) {
+        if ((textureIndex >= textures.size()) || isEmpty()) {
+            return false;
+        }
+
+        bool presented = false;
+        const WebGPUTexture *source = static_cast<const WebGPUTexture *>(textures[textureIndex].get());
+        webgpuRunOnMain([&]() {
+            WGPUSurfaceTexture surfaceTexture = WGPU_SURFACE_TEXTURE_INIT;
+            wgpuSurfaceGetCurrentTexture(surface, &surfaceTexture);
+            if ((surfaceTexture.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal) && (surfaceTexture.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal)) {
+                device->reportError("the canvas has no texture to present to");
+                return;
+            }
+
+            WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            src.texture = source->texture;
+            dst.texture = surfaceTexture.texture;
+
+            const WGPUExtent3D size = { std::min(width, wgpuTextureGetWidth(surfaceTexture.texture)), std::min(height, wgpuTextureGetHeight(surfaceTexture.texture)), 1 };
+            WGPUCommandEncoderDescriptor encoderDesc = WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT;
+            WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device->device, &encoderDesc);
+            wgpuCommandEncoderCopyTextureToTexture(encoder, &src, &dst, &size);
+
+            WGPUCommandBufferDescriptor commandBufferDesc = WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT;
+            WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder, &commandBufferDesc);
+            wgpuQueueSubmit(device->queue, 1, &commandBuffer);
+            wgpuCommandBufferRelease(commandBuffer);
+            wgpuCommandEncoderRelease(encoder);
+            wgpuTextureRelease(surfaceTexture.texture);
+            presented = true;
+        });
+
+        return presented;
+    }
+
+    void WebGPUSwapChain::wait() {
+    }
+
+    bool WebGPUSwapChain::resize() {
+        uint32_t canvasWidth = 0;
+        uint32_t canvasHeight = 0;
+        canvasSize(canvasWidth, canvasHeight);
+        if ((canvasWidth == width) && (canvasHeight == height) && !textures.empty()) {
+            return true;
+        }
+
+        width = canvasWidth;
+        height = canvasHeight;
+        textures.clear();
+        if (isEmpty()) {
+            return false;
+        }
+
+        webgpuRunOnMain([&]() {
+            WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
+            config.device = device->device;
+            config.format = format;
+            config.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopyDst;
+            config.width = width;
+            config.height = height;
+            config.alphaMode = WGPUCompositeAlphaMode_Opaque;
+            config.presentMode = WGPUPresentMode_Fifo;
+            wgpuSurfaceConfigure(surface, &config);
+        });
+
+        const uint32_t textureCount = std::max<uint32_t>(desc.textureCount, 1);
+        for (uint32_t i = 0; i < textureCount; i++) {
+            textures.push_back(device->createTexture(RenderTextureDesc::ColorTarget(width, height, desc.format)));
+        }
+
+        return true;
+    }
+
+    bool WebGPUSwapChain::needsResize() const {
+        uint32_t canvasWidth = 0;
+        uint32_t canvasHeight = 0;
+        canvasSize(canvasWidth, canvasHeight);
+        return (canvasWidth != width) || (canvasHeight != height);
+    }
+
+    void WebGPUSwapChain::setVsyncEnabled(bool vsyncEnabled) {
+        this->vsyncEnabled = vsyncEnabled;
+    }
+
+    bool WebGPUSwapChain::isVsyncEnabled() const {
+        return vsyncEnabled;
+    }
+
+    uint32_t WebGPUSwapChain::getWidth() const {
+        return width;
+    }
+
+    uint32_t WebGPUSwapChain::getHeight() const {
+        return height;
+    }
+
+    RenderTexture *WebGPUSwapChain::getTexture(uint32_t textureIndex) {
+        return (textureIndex < textures.size()) ? textures[textureIndex].get() : nullptr;
+    }
+
+    uint32_t WebGPUSwapChain::getTextureCount() const {
+        return uint32_t(textures.size());
+    }
+
+    bool WebGPUSwapChain::acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) {
+        if (textures.empty()) {
+            return false;
+        }
+
+        *textureIndex = nextTexture;
+        nextTexture = (nextTexture + 1) % uint32_t(textures.size());
+        return true;
+    }
+
+    RenderWindow WebGPUSwapChain::getWindow() const {
+        return desc.renderWindow;
+    }
+
+    bool WebGPUSwapChain::isEmpty() const {
+        return (width == 0) || (height == 0);
+    }
+
+    uint32_t WebGPUSwapChain::getRefreshRate() const {
+        return 60;
     }
 
     void WebGPUCommandQueue::executeCommandLists(const RenderCommandList **commandLists, uint32_t commandListCount, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount, RenderCommandSemaphore **signalSemaphores, uint32_t signalSemaphoreCount, RenderCommandFence *signalFence) {
