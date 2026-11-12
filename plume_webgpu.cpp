@@ -1818,6 +1818,27 @@ namespace plume {
         }
     };
 
+    void webgpuRecordRenderPassJob(RenderCommandList *commandList, std::function<void(WGPURenderPassEncoder)> job) {
+        static_cast<WebGPUCommandList *>(commandList)->commands.emplace_back([job = std::move(job)](WebGPUContext &ctx) {
+            if (ctx.framebuffer == nullptr) {
+                return;
+            }
+
+            if (ctx.renderPass == nullptr) {
+                ctx.beginRenderPass();
+            }
+
+            job(ctx.renderPass);
+            ctx.graphicsPipelineDirty = true;
+            ctx.graphics.groupsDirty = true;
+            ctx.graphics.pushDirty = true;
+            ctx.vertexBuffersDirty = true;
+            ctx.indexBufferDirty = true;
+            ctx.viewportDirty = true;
+            ctx.scissorDirty = true;
+        });
+    }
+
     // WebGPUCommandList
 
     WebGPUCommandList::WebGPUCommandList(WebGPUDevice *device) {

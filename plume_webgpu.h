@@ -47,6 +47,9 @@ namespace plume {
     // Like webgpuRunOnMain, but the job ends when it calls done (from a WebGPU callback, after the main thread yields). Not callable from the main thread.
     void webgpuRunOnMainAsync(const std::function<void(std::function<void()> done)> &job);
 
+    // Records a job that draws straight into the list's current render pass at replay (ImGui); bound state is reapplied afterwards.
+    void webgpuRecordRenderPassJob(RenderCommandList *commandList, std::function<void(WGPURenderPassEncoder)> job);
+
     struct WebGPUBuffer : RenderBuffer {
         WebGPUDevice *device = nullptr;
         RenderBufferDesc desc;
