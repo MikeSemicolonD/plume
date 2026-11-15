@@ -503,6 +503,7 @@ namespace plume {
 
     VulkanNativeHandles GetVulkanNativeHandles(RenderDevice *device, RenderCommandQueue *commandQueue);
 
-    // Wraps an image owned by someone else (an OpenXR swapchain image, in COLOR_ATTACHMENT_OPTIMAL) for use as a copy destination.
-    std::unique_ptr<RenderTexture> WrapVulkanImage(RenderDevice *device, VkImage image, RenderFormat format, uint32_t width, uint32_t height);
+    // Wraps an image owned by someone else (an OpenXR swapchain image, in COLOR_ATTACHMENT_OPTIMAL) for use as a copy destination, or with
+    // renderTarget also as a framebuffer attachment through a view in `format` (the image must allow that format).
+    std::unique_ptr<RenderTexture> WrapVulkanImage(RenderDevice *device, VkImage image, RenderFormat format, uint32_t width, uint32_t height, bool renderTarget = false);
 };

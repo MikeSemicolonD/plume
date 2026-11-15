@@ -5011,7 +5011,7 @@ namespace plume {
         return handles;
     }
 
-    std::unique_ptr<RenderTexture> WrapVulkanImage(RenderDevice *device, VkImage image, RenderFormat format, uint32_t width, uint32_t height) {
+    std::unique_ptr<RenderTexture> WrapVulkanImage(RenderDevice *device, VkImage image, RenderFormat format, uint32_t width, uint32_t height, bool renderTarget) {
         std::unique_ptr<VulkanTexture> texture = std::make_unique<VulkanTexture>(static_cast<VulkanDevice *>(device), image);
         texture->desc.dimension = RenderTextureDimension::TEXTURE_2D;
         texture->desc.format = format;
@@ -5023,8 +5023,12 @@ namespace plume {
         texture->desc.flags = RenderTextureFlag::RENDER_TARGET;
         texture->fillSubresourceRange();
 
-        // OpenXR hands its images over in COLOR_ATTACHMENT_OPTIMAL and wants them back that way; only copies write them, so no view is made.
+        // OpenXR hands its images over in COLOR_ATTACHMENT_OPTIMAL and wants them back that way; copies need no view, drawing does.
         texture->textureLayout = RenderTextureLayout::COLOR_WRITE;
+        if (renderTarget) {
+            texture->createImageView(toVk(format));
+        }
+
         return texture;
     }
 
