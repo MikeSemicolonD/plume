@@ -27,18 +27,6 @@
 #pragma clang diagnostic pop
 #endif
 
-// RogueSquadron64Recomp: route D3D12 debug-layer messages to stderr so a bad barrier /
-// resource-state (which stalls the driver submit on the hangar frame) is visible without a
-// debugger attached. Registered via ID3D12InfoQueue1 below.
-[[maybe_unused]] static void CALLBACK rs64_d3d12_debug_msg(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity,
-        D3D12_MESSAGE_ID id, LPCSTR desc, void *) {
-    const char *s = (severity == D3D12_MESSAGE_SEVERITY_CORRUPTION) ? "CORRUPTION"
-                  : (severity == D3D12_MESSAGE_SEVERITY_ERROR) ? "ERROR"
-                  : (severity == D3D12_MESSAGE_SEVERITY_WARNING) ? "WARNING" : "INFO";
-    std::fprintf(stderr, "[d3d12-debug %s id=%d] %s\n", s, (int)id, desc ? desc : "");
-    std::fflush(stderr);
-}
-
 #ifndef NDEBUG
 #   define D3D12_DEBUG_LAYER_ENABLED
 #   define D3D12_DEBUG_LAYER_BREAK_ON_ERROR false
