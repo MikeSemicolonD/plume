@@ -1581,8 +1581,9 @@ namespace plume {
 
         VkPipelineViewportStateCreateInfo viewportState = {};
         viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        viewportState.viewportCount = renderTargetCount;
-        viewportState.scissorCount = renderTargetCount;
+        // One viewport and scissor per draw, whatever the target count (the command lists set one); more needs multiViewport and leaves the rest unset.
+        viewportState.viewportCount = std::min(renderTargetCount, 1u);
+        viewportState.scissorCount = std::min(renderTargetCount, 1u);
 
         VkPipelineRasterizationStateCreateInfo rasterization = {};
         rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -3049,6 +3050,22 @@ namespace plume {
             return;
         }
 
+        // A barrier may only name stages its queue's family runs: a copy queue only transfers and a compute queue draws nothing. Work on other queues is ordered by semaphores.
+        if (queue->type == RenderCommandListType::COPY) {
+            const VkPipelineStageFlags allowed = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+            srcStageMask &= allowed;
+            dstStageMask &= allowed;
+        }
+        else if (queue->type == RenderCommandListType::COMPUTE) {
+            VkPipelineStageFlags allowed = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
+            if (rtEnabled) {
+                allowed |= VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+            }
+
+            srcStageMask &= allowed;
+            dstStageMask &= allowed;
+        }
+
         vkCmdPipelineBarrier(vk, srcStageMask, dstStageMask, 0, 0, nullptr, uint32_t(bufferMemoryBarriers.size()), bufferMemoryBarriers.data(), uint32_t(imageMemoryBarriers.size()), imageMemoryBarriers.data());
     }
 
@@ -3243,13 +3260,20 @@ namespace plume {
         }
     }
 
+    // Vulkan scissor offsets must not be negative (D3D12's may be), so the rect is cut at 0 and keeps its right and bottom edges.
+    static VkRect2D toVkScissor(const RenderRect &r) {
+        const int32_t left = std::max(r.left, 0);
+        const int32_t top = std::max(r.top, 0);
+        return VkRect2D{ VkOffset2D{ left, top }, VkExtent2D{ uint32_t(std::max(r.right - left, 0)), uint32_t(std::max(r.bottom - top, 0)) } };
+    }
+
     void VulkanCommandList::setScissors(const RenderRect *scissorRects, uint32_t count) {
         if (count > 1) {
             thread_local std::vector<VkRect2D> scissorVector;
             scissorVector.clear();
 
             for (uint32_t i = 0; i < count; i++) {
-                scissorVector.emplace_back(VkRect2D{ VkOffset2D{ scissorRects[i].left, scissorRects[i].top }, VkExtent2D{ uint32_t(scissorRects[i].right - scissorRects[i].left), uint32_t(scissorRects[i].bottom - scissorRects[i].top) } });
+                scissorVector.emplace_back(toVkScissor(scissorRects[i]));
             }
 
             if (!scissorVector.empty()) {
@@ -3258,7 +3282,7 @@ namespace plume {
         }
         else {
             // Single element fast path.
-            VkRect2D scissor = VkRect2D{ VkOffset2D{ scissorRects[0].left, scissorRects[0].top }, VkExtent2D{ uint32_t(scissorRects[0].right - scissorRects[0].left), uint32_t(scissorRects[0].bottom - scissorRects[0].top) } };
+            VkRect2D scissor = toVkScissor(scissorRects[0]);
             vkCmdSetScissor(vk, 0, 1, &scissor);
         }
     }
