@@ -2309,7 +2309,48 @@ namespace plume {
         });
     }
 
+    // The instance table from buildData (absolute BLAS offsets) with each offset made relative to this TLAS, copied in through a staging
+    // buffer so the write lands in command order. instancesBuffer goes unused: the same bytes are in buildData.
     void WebGPUCommandList::buildTopLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, RenderBufferReference instancesBuffer, const RenderTopLevelASBuildInfo &buildInfo) {
+        const auto *dst = static_cast<const WebGPUAccelerationStructure *>(dstAccelerationStructure);
+        if ((dst == nullptr) || (buildInfo.buildData.size() < sizeof(webgpu_as::TlasHeader))) {
+            return;
+        }
+
+        if (buildInfo.buildData.size() > dst->size) {
+            device->reportError("a TLAS build needs " + std::to_string(buildInfo.buildData.size()) + " bytes; its structure has " + std::to_string(dst->size));
+            return;
+        }
+
+        std::vector<uint8_t> table = buildInfo.buildData;
+        for (uint32_t i = 0; i < buildInfo.instanceCount; i++) {
+            webgpu_as::Instance inst;
+            uint8_t *at = table.data() + sizeof(webgpu_as::TlasHeader) + size_t(i) * sizeof(webgpu_as::Instance);
+            memcpy(&inst, at, sizeof(inst));
+            if (inst.blasOffset < dst->offset) {
+                inst.mask = 0;
+                inst.blasOffset = 0;
+            }
+            else {
+                inst.blasOffset = uint32_t(inst.blasOffset - dst->offset);
+            }
+
+            memcpy(at, &inst, sizeof(inst));
+        }
+
+        const uint64_t dstOffset = dst->offset;
+        commands.emplace_back([table = std::move(table), dstOffset](WebGPUContext &ctx) {
+            ctx.endPasses();
+            WGPUBufferDescriptor stagingDesc = WGPU_BUFFER_DESCRIPTOR_INIT;
+            stagingDesc.size = webgpu_as::alignUp(table.size(), 4);
+            stagingDesc.usage = WGPUBufferUsage_CopySrc;
+            stagingDesc.mappedAtCreation = true;
+            WGPUBuffer staging = wgpuDeviceCreateBuffer(ctx.device->device, &stagingDesc);
+            memcpy(wgpuBufferGetMappedRange(staging, 0, stagingDesc.size), table.data(), table.size());
+            wgpuBufferUnmap(staging);
+            wgpuCommandEncoderCopyBufferToBuffer(ctx.encoder, staging, 0, ctx.device->asHeap->buffer, dstOffset, stagingDesc.size);
+            wgpuBufferRelease(staging);
+        });
     }
 
     void WebGPUCommandList::discardTexture(const RenderTexture *texture) {
