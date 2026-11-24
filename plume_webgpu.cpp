@@ -6,6 +6,7 @@
 //
 
 #include "plume_webgpu.h"
+#include "plume_webgpu_as.h"
 
 #include <algorithm>
 #include <cassert>
@@ -770,13 +771,16 @@ namespace plume {
 
     // WebGPUBuffer
 
-    WebGPUBuffer::WebGPUBuffer(WebGPUDevice *device, const RenderBufferDesc &desc) {
+    WebGPUBuffer::WebGPUBuffer(WebGPUDevice *device, const RenderBufferDesc &desc, bool cpuShadow) {
         this->device = device;
         this->desc = desc;
         readback = (desc.heapType == RenderHeapType::READBACK);
+        const bool placeholder = (desc.flags & RenderBufferFlag::ACCELERATION_STRUCTURE) != 0;
         // 16-byte multiples: WGSL pads uniform structs to 16, so a C++ struct bound whole can be smaller than the shader's.
-        allocatedSize = std::max<uint64_t>((desc.size + 15) & ~uint64_t(15), 16);
-        shadow.resize(allocatedSize);
+        allocatedSize = placeholder ? 16 : std::max<uint64_t>((desc.size + 15) & ~uint64_t(15), 16);
+        if (cpuShadow && !placeholder) {
+            shadow.resize(allocatedSize);
+        }
 
         WGPUBufferDescriptor bufferDesc = WGPU_BUFFER_DESCRIPTOR_INIT;
         bufferDesc.size = allocatedSize;
@@ -1116,7 +1120,30 @@ namespace plume {
         generation++;
     }
 
+    // The bound range starts at the TLAS and runs to the end of the AS heap: its BLASes sit past it (WebGPUDevice::asTlasRegion).
     void WebGPUDescriptorSet::setAccelerationStructure(uint32_t descriptorIndex, const RenderAccelerationStructure *accelerationStructure) {
+        assert(descriptorIndex < descriptors.size());
+
+        WebGPUDescriptor &descriptor = descriptors[descriptorIndex];
+        const auto *as = static_cast<const WebGPUAccelerationStructure *>(accelerationStructure);
+        descriptor.buffer = (as != nullptr) ? device->asHeap.get() : nullptr;
+        descriptor.offset = (as != nullptr) ? as->offset : 0;
+        descriptor.size = (as != nullptr) ? (device->asHeapSize - as->offset) : 0;
+        generation++;
+    }
+
+    // WebGPUAccelerationStructure
+
+    WebGPUAccelerationStructure::WebGPUAccelerationStructure(WebGPUDevice *device, const RenderAccelerationStructureDesc &desc, uint64_t offset) {
+        this->device = device;
+        type = desc.type;
+        key = desc.buffer.ref;
+        this->offset = offset;
+        size = desc.size;
+    }
+
+    WebGPUAccelerationStructure::~WebGPUAccelerationStructure() {
+        device->asRelease(this);
     }
 
     // WebGPUPipelineLayout
@@ -2750,7 +2777,9 @@ namespace plume {
         capabilities.computeShaders = true;
         capabilities.geometryShader = false;
         capabilities.raytracing = false;
-        capabilities.rayQuery = false;
+        // Software ray queries (plume_webgpu_as.h): the traced passes bind 15 storage buffers per stage. Never on a phone.
+        phone = MAIN_THREAD_EM_ASM_INT({ return (navigator.userAgentData ? navigator.userAgentData.mobile : /Android|iPhone|iPad/i.test(navigator.userAgent)) ? 1 : 0; }) != 0;
+        capabilities.rayQuery = (limits.maxStorageBuffersPerShaderStage >= 15) && !phone;
         capabilities.descriptorIndexing = false;
         capabilities.maxTexturesPerStage = limits.maxSampledTexturesPerShaderStage;
         capabilities.maxStorageBuffersPerStage = limits.maxStorageBuffersPerShaderStage;
@@ -2814,7 +2843,7 @@ namespace plume {
     void WebGPUDevice::markDirty(WebGPUBuffer *buffer, uint64_t begin, uint64_t end) {
         // writeBuffer takes 4-byte-aligned ranges; the shadow holds the bytes around the written ones too.
         begin &= ~uint64_t(3);
-        end = std::min((end + 3) & ~uint64_t(3), buffer->allocatedSize);
+        end = std::min((end + 3) & ~uint64_t(3), uint64_t(buffer->shadow.size()));
         if (end <= begin) {
             return;
         }
@@ -3108,7 +3137,81 @@ namespace plume {
     }
 
     std::unique_ptr<RenderAccelerationStructure> WebGPUDevice::createAccelerationStructure(const RenderAccelerationStructureDesc &desc) {
-        return nullptr;
+        uint64_t offset = 0;
+        if (!asAllocate(desc.type, desc.size, offset)) {
+            reportError("the acceleration structure heap has no room for " + std::to_string(desc.size) + " bytes");
+            return nullptr;
+        }
+
+        auto as = std::make_unique<WebGPUAccelerationStructure>(this, desc, offset);
+        std::lock_guard<std::mutex> lock(asMutex);
+        if (as->key != nullptr) {
+            asByKey[as->key] = as.get();
+        }
+
+        return as;
+    }
+
+    // First fit in the TLAS region or above it. The heap is made on first use, as large as the device allows up to 256 MB, and never grows:
+    // growing would orphan bind groups and builds already recorded against it.
+    bool WebGPUDevice::asAllocate(RenderAccelerationStructureType type, uint64_t size, uint64_t &offset) {
+        std::lock_guard<std::mutex> lock(asMutex);
+        if (asHeap == nullptr) {
+            asHeapSize = std::min<uint64_t>({ uint64_t(256) << 20, limits.maxStorageBufferBindingSize, limits.maxBufferSize }) & ~uint64_t(webgpu_as::kAlign - 1);
+            asHeap = std::make_unique<WebGPUBuffer>(this, RenderBufferDesc::DefaultBuffer(asHeapSize, RenderBufferFlag::STORAGE), false);
+            asFreeRanges[0] = asTlasRegion;
+            asFreeRanges[asTlasRegion] = asHeapSize - asTlasRegion;
+        }
+
+        const bool tlas = (type == RenderAccelerationStructureType::TOP_LEVEL);
+        const uint64_t need = webgpu_as::alignUp(std::max<uint64_t>(size, 1), webgpu_as::kAlign);
+        for (auto it = asFreeRanges.begin(); it != asFreeRanges.end(); it++) {
+            if ((it->first < asTlasRegion) != tlas) {
+                continue;
+            }
+
+            if (it->second >= need) {
+                offset = it->first;
+                const uint64_t rest = it->second - need;
+                asFreeRanges.erase(it);
+                if (rest > 0) {
+                    asFreeRanges[offset + need] = rest;
+                }
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void WebGPUDevice::asRelease(WebGPUAccelerationStructure *accelerationStructure) {
+        std::lock_guard<std::mutex> lock(asMutex);
+        auto key = asByKey.find(accelerationStructure->key);
+        if ((key != asByKey.end()) && (key->second == accelerationStructure)) {
+            asByKey.erase(key);
+        }
+
+        uint64_t begin = accelerationStructure->offset;
+        uint64_t end = begin + webgpu_as::alignUp(std::max<uint64_t>(accelerationStructure->size, 1), webgpu_as::kAlign);
+
+        // Merge with free neighbours, never across the TLAS region's edge.
+        auto next = asFreeRanges.lower_bound(end);
+        if ((next != asFreeRanges.end()) && (next->first == end) && (end != asTlasRegion)) {
+            end += next->second;
+            asFreeRanges.erase(next);
+        }
+
+        auto prev = asFreeRanges.lower_bound(begin);
+        if ((prev != asFreeRanges.begin()) && (begin != asTlasRegion)) {
+            prev--;
+            if ((prev->first + prev->second) == begin) {
+                begin = prev->first;
+                asFreeRanges.erase(prev);
+            }
+        }
+
+        asFreeRanges[begin] = end - begin;
     }
 
     std::unique_ptr<RenderPool> WebGPUDevice::createPool(const RenderPoolDesc &desc) {
@@ -3136,9 +3239,60 @@ namespace plume {
     }
 
     void WebGPUDevice::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) {
+        buildInfo = RenderBottomLevelASBuildInfo();
+        buildInfo.preferFastBuild = preferFastBuild;
+        buildInfo.preferFastTrace = preferFastTrace;
+        if (meshCount != 1) {
+            reportError("a WebGPU BLAS builds from exactly one mesh, not " + std::to_string(meshCount));
+            return;
+        }
+
+        const RenderBottomLevelASMesh &mesh = meshes[0];
+        if ((mesh.indexFormat != RenderFormat::R32_UINT) || (mesh.vertexFormat != RenderFormat::R32G32B32_FLOAT) || ((mesh.vertexStride % 4) != 0)) {
+            reportError("a WebGPU BLAS needs 32-bit indices and float3 positions on a 4-byte stride");
+            return;
+        }
+
+        WebGPUBlasBuildData data;
+        data.indexBuffer = static_cast<const WebGPUBuffer *>(mesh.indexBuffer.ref);
+        data.indexOffset = mesh.indexBuffer.offset;
+        data.vertexBuffer = static_cast<const WebGPUBuffer *>(mesh.vertexBuffer.ref);
+        data.vertexOffset = mesh.vertexBuffer.offset;
+        data.vertexStride = mesh.vertexStride;
+        data.vertexCount = mesh.vertexCount;
+        data.triCount = mesh.indexCount / 3;
+        data.opaque = mesh.isOpaque ? 1 : 0;
+        buildInfo.meshCount = 1;
+        buildInfo.primitiveCount = data.triCount;
+        buildInfo.accelerationStructureSize = webgpu_as::blasSize(data.triCount);
+        buildInfo.scratchSize = webgpu_as::blasScratchSize(data.triCount);
+        buildInfo.buildData.resize(sizeof(data));
+        memcpy(buildInfo.buildData.data(), &data, sizeof(data));
     }
 
+    // The instance table goes to the user (instancesBufferData) and stays in buildData with absolute BLAS heap offsets; buildTopLevelAS makes
+    // them relative to the TLAS. An instance whose BLAS isn't a live AS gets a zero mask.
     void WebGPUDevice::setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild, bool preferFastTrace) {
+        buildInfo = RenderTopLevelASBuildInfo();
+        buildInfo.preferFastBuild = preferFastBuild;
+        buildInfo.preferFastTrace = preferFastTrace;
+        std::vector<webgpu_as::InstanceIn> in(instanceCount);
+        std::lock_guard<std::mutex> lock(asMutex);
+        for (uint32_t i = 0; i < instanceCount; i++) {
+            const RenderTopLevelASInstance &src = instances[i];
+            auto it = asByKey.find(src.bottomLevelAS.ref);
+            memcpy(in[i].objectToWorld, src.transform.m, sizeof(in[i].objectToWorld));
+            in[i].mask = (it != asByKey.end()) ? src.instanceMask : 0;
+            in[i].instanceID = src.instanceID;
+            in[i].cullDisable = src.cullDisable;
+            in[i].blasOffset = (it != asByKey.end()) ? uint32_t(it->second->offset) : 0;
+        }
+
+        buildInfo.instancesBufferData = webgpu_as::packInstances(in.data(), instanceCount);
+        buildInfo.buildData = buildInfo.instancesBufferData;
+        buildInfo.instanceCount = instanceCount;
+        buildInfo.accelerationStructureSize = webgpu_as::tlasSize(instanceCount);
+        buildInfo.scratchSize = webgpu_as::kAlign;
     }
 
     void WebGPUDevice::setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) {

@@ -29,6 +29,7 @@
 namespace plume {
     struct WebGPUBuffer;
     struct WebGPUDevice;
+    struct WebGPUAccelerationStructure;
     struct WebGPUInterface;
     struct WebGPUPipeline;
     struct WebGPUPipelineLayout;
@@ -58,7 +59,8 @@ namespace plume {
         std::vector<uint8_t> shadow;
         bool readback = false;
 
-        WebGPUBuffer(WebGPUDevice *device, const RenderBufferDesc &desc);
+        // cpuShadow false: GPU-only (the AS heap). A buffer flagged ACCELERATION_STRUCTURE is a 16-byte placeholder: its AS lives in the device's AS heap.
+        WebGPUBuffer(WebGPUDevice *device, const RenderBufferDesc &desc, bool cpuShadow = true);
         ~WebGPUBuffer() override;
         void *map(uint32_t subresource, const RenderRange *readRange) override;
         void unmap(uint32_t subresource, const RenderRange *writtenRange) override;
@@ -398,6 +400,21 @@ namespace plume {
         uint64_t pushRingSize = 0;
         uint64_t pushRingGeneration = 0;
 
+        // The page runs on a phone: no software ray queries there.
+        bool phone = false;
+
+        // Software acceleration structures (plume_webgpu_as.h): one storage buffer of fixed size, made on first use. TLASes take the first
+        // asTlasRegion bytes, so a TLAS bound as the start of the range always comes before its BLASes.
+        static constexpr uint64_t asTlasRegion = 64 * 1024;
+        std::mutex asMutex;
+        std::unique_ptr<WebGPUBuffer> asHeap;
+        uint64_t asHeapSize = 0;
+        std::map<uint64_t, uint64_t> asFreeRanges;
+        std::unordered_map<const RenderBuffer *, WebGPUAccelerationStructure *> asByKey;
+
+        bool asAllocate(RenderAccelerationStructureType type, uint64_t size, uint64_t &offset);
+        void asRelease(WebGPUAccelerationStructure *accelerationStructure);
+
         WebGPUDevice(WebGPUInterface *renderInterface, const std::string &preferredDeviceName);
         ~WebGPUDevice() override;
         std::unique_ptr<RenderDescriptorSet> createDescriptorSet(const RenderDescriptorSetDesc &desc) override;
@@ -435,6 +452,30 @@ namespace plume {
         std::shared_ptr<const WebGPUPreparedShader> prepareInterpolation(const std::shared_ptr<const WebGPUPreparedShader> &vertex, const std::shared_ptr<const WebGPUPreparedShader> &pixel);
         const WebGPUModule &getModule(const WebGPUPreparedShader &shaderPrepared);
         std::string moduleKey(const WebGPUShader *shader, const RenderSpecConstant *specConstants, uint32_t specConstantsCount, WGPUShaderStage stage) const;
+    };
+
+    // A range of the device's AS heap. The buffer RT64 passed in the desc only keys the AS for TLAS instances.
+    struct WebGPUAccelerationStructure : RenderAccelerationStructure {
+        WebGPUDevice *device = nullptr;
+        RenderAccelerationStructureType type = RenderAccelerationStructureType::UNKNOWN;
+        const RenderBuffer *key = nullptr;
+        uint64_t offset = 0;
+        uint64_t size = 0;
+
+        WebGPUAccelerationStructure(WebGPUDevice *device, const RenderAccelerationStructureDesc &desc, uint64_t offset);
+        ~WebGPUAccelerationStructure() override;
+    };
+
+    // RenderBottomLevelASBuildInfo::buildData: the one mesh a WebGPU BLAS builds from.
+    struct WebGPUBlasBuildData {
+        const WebGPUBuffer *indexBuffer = nullptr;
+        uint64_t indexOffset = 0;
+        const WebGPUBuffer *vertexBuffer = nullptr;
+        uint64_t vertexOffset = 0;
+        uint32_t vertexStride = 0;
+        uint32_t vertexCount = 0;
+        uint32_t triCount = 0;
+        uint32_t opaque = 0;
     };
 
     struct WebGPUInterface : RenderInterface {
