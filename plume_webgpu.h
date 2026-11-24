@@ -412,6 +412,9 @@ namespace plume {
         std::map<uint64_t, uint64_t> asFreeRanges;
         std::unordered_map<const RenderBuffer *, WebGPUAccelerationStructure *> asByKey;
 
+        // The BLAS builder's pipelines (plume_webgpu_as.cpp), made on the main thread at the first build.
+        std::shared_ptr<void> asBuilder;
+
         bool asAllocate(RenderAccelerationStructureType type, uint64_t size, uint64_t &offset);
         void asRelease(WebGPUAccelerationStructure *accelerationStructure);
 
@@ -477,6 +480,9 @@ namespace plume {
         uint32_t triCount = 0;
         uint32_t opaque = 0;
     };
+
+    // Encodes a BLAS build into its own compute pass (main thread, during replay); plume_webgpu_as.cpp.
+    void webgpuEncodeBlasBuild(WebGPUDevice *device, WGPUCommandEncoder encoder, const WebGPUBlasBuildData &data, uint64_t dstOffset, const WebGPUBuffer *scratch, uint64_t scratchOffset);
 
     struct WebGPUInterface : RenderInterface {
         WebGPUShaderConverter converter;

@@ -2288,6 +2288,25 @@ namespace plume {
     }
 
     void WebGPUCommandList::buildBottomLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, const RenderBottomLevelASBuildInfo &buildInfo) {
+        const auto *dst = static_cast<const WebGPUAccelerationStructure *>(dstAccelerationStructure);
+        if ((dst == nullptr) || (buildInfo.buildData.size() != sizeof(WebGPUBlasBuildData))) {
+            return;
+        }
+
+        if (buildInfo.accelerationStructureSize > dst->size) {
+            device->reportError("a BLAS build needs " + std::to_string(buildInfo.accelerationStructureSize) + " bytes; its structure has " + std::to_string(dst->size));
+            return;
+        }
+
+        WebGPUBlasBuildData data;
+        memcpy(&data, buildInfo.buildData.data(), sizeof(data));
+        const WebGPUBuffer *scratch = static_cast<const WebGPUBuffer *>(scratchBuffer.ref);
+        const uint64_t dstOffset = dst->offset;
+        const uint64_t scratchOffset = scratchBuffer.offset;
+        commands.emplace_back([=](WebGPUContext &ctx) {
+            ctx.endPasses();
+            webgpuEncodeBlasBuild(ctx.device, ctx.encoder, data, dstOffset, scratch, scratchOffset);
+        });
     }
 
     void WebGPUCommandList::buildTopLevelAS(const RenderAccelerationStructure *dstAccelerationStructure, RenderBufferReference scratchBuffer, RenderBufferReference instancesBuffer, const RenderTopLevelASBuildInfo &buildInfo) {

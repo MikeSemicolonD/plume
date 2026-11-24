@@ -83,6 +83,8 @@ endif()
 if(EMSCRIPTEN)
     list(APPEND PLUME_SOURCES
         plume_webgpu.cpp
+        plume_webgpu_as.cpp
+        plume_webgpu_as.h
         plume_webgpu.h
     )
 endif()
