@@ -1470,6 +1470,8 @@ namespace plume {
             passDesc.colorAttachments = colors.data();
             if (framebuffer->depthView != nullptr) {
                 depth.view = framebuffer->depthView;
+                // NaN (the descriptor default) is rejected even on an attachment that never clears.
+                depth.depthClearValue = depthClearValue;
                 if (framebuffer->depthReadOnly) {
                     depth.depthReadOnly = true;
                 }
@@ -2782,7 +2784,7 @@ namespace plume {
                 }
 
                 std::vector<WGPUFeatureName> features;
-                const WGPUFeatureName optionalFeatures[] = { WGPUFeatureName_DualSourceBlending, WGPUFeatureName_Float32Filterable, WGPUFeatureName_DepthClipControl };
+                const WGPUFeatureName optionalFeatures[] = { WGPUFeatureName_DualSourceBlending, WGPUFeatureName_Float32Filterable, WGPUFeatureName_DepthClipControl, WGPUFeatureName_TextureFormatsTier1 };
                 for (WGPUFeatureName feature : optionalFeatures) {
                     if (wgpuAdapterHasFeature(adapter, feature)) {
                         features.push_back(feature);
@@ -2791,6 +2793,7 @@ namespace plume {
 
                 self->dualSourceBlending = wgpuAdapterHasFeature(adapter, WGPUFeatureName_DualSourceBlending);
                 self->depthClipControl = wgpuAdapterHasFeature(adapter, WGPUFeatureName_DepthClipControl);
+                self->textureFormatsTier1 = wgpuAdapterHasFeature(adapter, WGPUFeatureName_TextureFormatsTier1);
 
                 WGPUDeviceDescriptor deviceDesc = WGPU_DEVICE_DESCRIPTOR_INIT;
                 deviceDesc.requiredFeatureCount = features.size();
@@ -2837,9 +2840,10 @@ namespace plume {
         capabilities.computeShaders = true;
         capabilities.geometryShader = false;
         capabilities.raytracing = false;
-        // Software ray queries (plume_webgpu_as.h): the traced passes bind 15 storage buffers per stage. Never on a phone.
-        phone = MAIN_THREAD_EM_ASM_INT({ return (navigator.userAgentData ? navigator.userAgentData.mobile : /Android|iPhone|iPad/i.test(navigator.userAgent)) ? 1 : 0; }) != 0;
-        capabilities.rayQuery = (limits.maxStorageBuffersPerShaderStage >= 15) && !phone;
+        // Software ray queries (plume_webgpu_as.h): the traced passes bind 15 storage buffers per stage and render to rgba16unorm. Never on a phone.
+        // Either signal counts; an iPad reports a Mac user agent with touch points.
+        phone = MAIN_THREAD_EM_ASM_INT({ const ua = navigator.userAgent; return ((navigator.userAgentData && navigator.userAgentData.mobile) || /Android|iPhone|iPad|Mobile/i.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1)) ? 1 : 0; }) != 0;
+        capabilities.rayQuery = (limits.maxStorageBuffersPerShaderStage >= 15) && textureFormatsTier1 && !phone;
         capabilities.descriptorIndexing = false;
         capabilities.maxTexturesPerStage = limits.maxSampledTexturesPerShaderStage;
         capabilities.maxStorageBuffersPerStage = limits.maxStorageBuffersPerShaderStage;

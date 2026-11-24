@@ -362,6 +362,7 @@ namespace plume {
         RenderDeviceDescription description;
         bool dualSourceBlending = false;
         bool depthClipControl = false;
+        bool textureFormatsTier1 = false;
 
         std::mutex convertMutex;
         std::unordered_map<std::string, std::shared_ptr<const WebGPUPreparedShader>> prepared;
