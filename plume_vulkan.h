@@ -114,6 +114,9 @@ namespace plume {
         VkAccelerationStructureKHR vk = VK_NULL_HANDLE;
         VulkanDevice *device = nullptr;
         RenderAccelerationStructureType type = RenderAccelerationStructureType::UNKNOWN;
+        // The buffer range it lives in, its key in VulkanDevice::accelerationStructures.
+        VkBuffer buffer = VK_NULL_HANDLE;
+        uint64_t offset = 0;
 
         VulkanAccelerationStructure(VulkanDevice *device, const RenderAccelerationStructureDesc &desc);
         ~VulkanAccelerationStructure() override;
@@ -414,15 +417,20 @@ namespace plume {
         VmaAllocator allocator = VK_NULL_HANDLE;
         VkPipelineCache pipelineCache = VK_NULL_HANDLE;
         std::mutex pipelineCacheMutex;
+        // Live acceleration structures by the buffer range they live in: TLAS instances name a BLAS by its buffer, and need the structure's own device address.
+        std::mutex accelerationStructuresMutex;
+        std::unordered_map<VkBuffer, std::unordered_map<uint64_t, VkAccelerationStructureKHR>> accelerationStructures;
         size_t pipelineCacheSavedSize = 0;
         uint32_t queueFamilyIndices[3] = {};
         std::vector<VulkanQueueFamily> queueFamilies;
         RenderDeviceCapabilities capabilities;
         RenderDeviceDescription description;
         VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtPipelineProperties = {};
+        VkPhysicalDeviceAccelerationStructurePropertiesKHR accelerationStructureProperties = {};
         VkPhysicalDeviceSampleLocationsPropertiesEXT sampleLocationProperties = {};
         std::unique_ptr<RenderBuffer> nullBuffer;
         bool loadStoreOpNoneSupported = false;
+        bool deviceFaultSupported = false;
         bool nullDescriptorSupported = false;
         std::atomic<bool> lost{ false };
 
@@ -434,6 +442,8 @@ namespace plume {
 
         // Records VK_ERROR_DEVICE_LOST once; returns true when res is a device loss.
         bool checkLost(VkResult res);
+        // Prints the driver's VK_EXT_device_fault report once the device is lost.
+        void reportFault();
         std::unique_ptr<RenderDescriptorSet> createDescriptorSet(const RenderDescriptorSetDesc &desc) override;
         std::unique_ptr<RenderShader> createShader(const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) override;
         std::unique_ptr<RenderSampler> createSampler(const RenderSamplerDesc &desc) override;

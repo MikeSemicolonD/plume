@@ -103,6 +103,7 @@ namespace plume {
         VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
         VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
         VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME,
+        VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
         // Vulkan spec requires this to be enabled if supported by the driver.
         VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
     };
@@ -897,6 +898,11 @@ namespace plume {
             minAlignment = device->rtPipelineProperties.shaderGroupBaseAlignment;
         }
 
+        // Acceleration structure builds need a scratch address aligned to the device's minimum (128 on NVIDIA); a misaligned one corrupts the build.
+        if (desc.flags & RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH) {
+            minAlignment = std::max<VkDeviceSize>(minAlignment, device->accelerationStructureProperties.minAccelerationStructureScratchOffsetAlignment);
+        }
+
         VkResult res;
         if (minAlignment > 0) {
             res = vmaCreateBufferWithAlignment(device->allocator, &bufferInfo, &createInfo, minAlignment, &vk, &allocation, &allocationInfo);
@@ -1153,12 +1159,29 @@ namespace plume {
             fprintf(stderr, "vkCreateAccelerationStructureKHR failed with error code 0x%X.\n", res);
             return;
         }
+
+        buffer = interfaceBuffer->vk;
+        offset = desc.buffer.offset;
+        std::scoped_lock lock(device->accelerationStructuresMutex);
+        device->accelerationStructures[buffer][offset] = vk;
     }
 
     VulkanAccelerationStructure::~VulkanAccelerationStructure() {
-        if (vk != VK_NULL_HANDLE) {
-            vkDestroyAccelerationStructureKHR(device->vk, vk, nullptr);
+        if (vk == VK_NULL_HANDLE) {
+            return;
         }
+
+        std::unique_lock lock(device->accelerationStructuresMutex);
+        auto it = device->accelerationStructures.find(buffer);
+        if ((it != device->accelerationStructures.end()) && (it->second.count(offset) != 0) && (it->second[offset] == vk)) {
+            it->second.erase(offset);
+            if (it->second.empty()) {
+                device->accelerationStructures.erase(it);
+            }
+        }
+
+        lock.unlock();
+        vkDestroyAccelerationStructureKHR(device->vk, vk, nullptr);
     }
 
     // VulkanDescriptorSetLayout
@@ -4104,6 +4127,14 @@ namespace plume {
             featuresChain = &rayQueryFeatures;
         }
 
+        VkPhysicalDeviceFaultFeaturesEXT faultFeatures = {};
+        const bool faultFound = supportedOptionalExtensions.find(VK_EXT_DEVICE_FAULT_EXTENSION_NAME) != supportedOptionalExtensions.end();
+        if (faultFound) {
+            faultFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
+            faultFeatures.pNext = featuresChain;
+            featuresChain = &faultFeatures;
+        }
+
         VkPhysicalDeviceFeatures2 deviceFeatures = {};
         deviceFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         deviceFeatures.pNext = featuresChain;
@@ -4112,6 +4143,8 @@ namespace plume {
         // Check for properties.
         if (rayTracingFound) {
             rtPipelineProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+            accelerationStructureProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
+            rtPipelineProperties.pNext = &accelerationStructureProperties;
 
             VkPhysicalDeviceProperties2 deviceProperties2 = {};
             deviceProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
@@ -4144,6 +4177,14 @@ namespace plume {
         if (rayQuerySupported) {
             rayQueryFeatures.pNext = createDeviceChain;
             createDeviceChain = &rayQueryFeatures;
+        }
+
+        // VK_EXT_device_fault: a lost device reports what the GPU faulted on (checkLost).
+        deviceFaultSupported = faultFound && faultFeatures.deviceFault;
+        if (deviceFaultSupported) {
+            faultFeatures.deviceFaultVendorBinary = VK_FALSE;
+            faultFeatures.pNext = createDeviceChain;
+            createDeviceChain = &faultFeatures;
         }
 
         const bool descriptorIndexingSupported = indexingFeatures.descriptorBindingPartiallyBound && indexingFeatures.descriptorBindingVariableDescriptorCount && indexingFeatures.runtimeDescriptorArray;
@@ -4452,9 +4493,49 @@ namespace plume {
 
         if (!lost.exchange(true, std::memory_order_acq_rel)) {
             fprintf(stderr, "[plume] VK_ERROR_DEVICE_LOST: device marked lost, further submits are skipped.\n");
+            reportFault();
         }
 
         return true;
+    }
+
+    void VulkanDevice::reportFault() {
+        if (!deviceFaultSupported || (vkGetDeviceFaultInfoEXT == nullptr)) {
+            fprintf(stderr, "[plume] device fault: no VK_EXT_device_fault report on this driver.\n");
+            return;
+        }
+
+        VkDeviceFaultCountsEXT counts = {};
+        counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
+        VkResult res = vkGetDeviceFaultInfoEXT(vk, &counts, nullptr);
+        if ((res != VK_SUCCESS) && (res != VK_INCOMPLETE)) {
+            fprintf(stderr, "[plume] device fault: counts query failed (%d).\n", int(res));
+            return;
+        }
+
+        std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+        std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+        counts.vendorBinarySize = 0;
+        VkDeviceFaultInfoEXT info = {};
+        info.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT;
+        info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+        info.pVendorInfos = vendors.empty() ? nullptr : vendors.data();
+        res = vkGetDeviceFaultInfoEXT(vk, &counts, &info);
+        fprintf(stderr, "[plume] device fault: \"%s\" (%u addresses, %u vendor records, result %d)\n", info.description, counts.addressInfoCount, counts.vendorInfoCount, int(res));
+
+        static const char *AddressTypes[] = { "none", "read-invalid", "write-invalid", "execute-invalid", "ip-unknown", "ip-invalid", "ip-fault" };
+        for (uint32_t i = 0; i < counts.addressInfoCount; i++) {
+            const VkDeviceFaultAddressInfoEXT &a = addresses[i];
+            const char *type = (uint32_t(a.addressType) < std::size(AddressTypes)) ? AddressTypes[a.addressType] : "?";
+            fprintf(stderr, "[plume]   address %s 0x%llX (+-0x%llX)\n", type, (unsigned long long)a.reportedAddress, (unsigned long long)a.addressPrecision);
+        }
+
+        for (uint32_t i = 0; i < counts.vendorInfoCount; i++) {
+            const VkDeviceFaultVendorInfoEXT &v = vendors[i];
+            fprintf(stderr, "[plume]   vendor \"%s\" code 0x%llX data 0x%llX\n", v.description, (unsigned long long)v.vendorFaultCode, (unsigned long long)v.vendorFaultData);
+        }
+
+        fflush(stderr);
     }
 
     VulkanDevice::~VulkanDevice() {
@@ -4619,10 +4700,30 @@ namespace plume {
             bufferInstance.flags = instance.cullDisable ? VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR : 0;
             memcpy(bufferInstance.transform.matrix, instance.transform.m, sizeof(bufferInstance.transform.matrix));
 
-            VkBufferDeviceAddressInfo blasAddressInfo = {};
-            blasAddressInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
-            blasAddressInfo.buffer = interfaceBottomLevelAS->vk;
-            bufferInstance.accelerationStructureReference = vkGetBufferDeviceAddress(vk, &blasAddressInfo) + instance.bottomLevelAS.offset;
+            // The structure's own address; a buffer range holding no live BLAS leaves the instance inactive (0) instead of pointing rays at garbage.
+            VkAccelerationStructureKHR blas = VK_NULL_HANDLE;
+            {
+                std::scoped_lock lock(accelerationStructuresMutex);
+                auto it = accelerationStructures.find(interfaceBottomLevelAS->vk);
+                if (it != accelerationStructures.end()) {
+                    auto at = it->second.find(instance.bottomLevelAS.offset);
+                    blas = (at != it->second.end()) ? at->second : VK_NULL_HANDLE;
+                }
+            }
+
+            if (blas != VK_NULL_HANDLE) {
+                VkAccelerationStructureDeviceAddressInfoKHR blasAddressInfo = {};
+                blasAddressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+                blasAddressInfo.accelerationStructure = blas;
+                bufferInstance.accelerationStructureReference = vkGetAccelerationStructureDeviceAddressKHR(vk, &blasAddressInfo);
+            }
+            else {
+                bufferInstance.accelerationStructureReference = 0;
+                static int s_logged = 0;
+                if (s_logged++ < 10) {
+                    fprintf(stderr, "[plume] TLAS instance %u (id %u) names a buffer with no acceleration structure; left inactive.\n", i, instance.instanceID);
+                }
+            }
         }
 
         // Retrieve the size the TLAS will require.
