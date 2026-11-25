@@ -1587,7 +1587,9 @@ namespace plume {
 
         VkPipelineRasterizationStateCreateInfo rasterization = {};
         rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rasterization.depthClampEnable = !desc.depthClipEnabled;
+        // Without the depthClamp feature (Raspberry Pi V3D) a pipeline asking for it is invalid, and V3D then neither clamps nor clips near geometry,
+        // which threw triangles behind the camera across the screen; there the GPU clips at the near plane instead.
+        rasterization.depthClampEnable = !desc.depthClipEnabled && device->depthClampSupported;
         rasterization.rasterizerDiscardEnable = VK_FALSE;
         rasterization.polygonMode = VK_POLYGON_MODE_FILL;
         rasterization.lineWidth = 1.0f;
@@ -4163,6 +4165,7 @@ namespace plume {
         deviceFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         deviceFeatures.pNext = featuresChain;
         vkGetPhysicalDeviceFeatures2(physicalDevice, &deviceFeatures);
+        depthClampSupported = deviceFeatures.features.depthClamp;
 
         // Check for properties.
         if (rayTracingFound) {

@@ -430,6 +430,7 @@ namespace plume {
         VkPhysicalDeviceSampleLocationsPropertiesEXT sampleLocationProperties = {};
         std::unique_ptr<RenderBuffer> nullBuffer;
         bool loadStoreOpNoneSupported = false;
+        bool depthClampSupported = false;
         bool deviceFaultSupported = false;
         bool nullDescriptorSupported = false;
         std::atomic<bool> lost{ false };
